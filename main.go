@@ -12,16 +12,11 @@ import (
 	"syscall"
 	"time"
 
+	conf logs "github.com/bartek5186/pcm2www/internal"
 	"github.com/getlantern/systray"
-
-	import "github.com/bartek5186/pcm2www/internal"
 )
 
-// Uwaga: ścieżka w go:embed jest względna względem TEGO pliku.
-// Jeśli trzymasz icon.ico w repo pod /assets/icon.ico i ten plik jest w cmd/tray/,
-// to poniższa ścieżka jest poprawna.
-//
-//go:embed ../../assets/icon.ico
+//go:embed assets/favicon.ico
 var iconData []byte
 
 // wersję możesz nadpisać przez: -ldflags "-X 'main.ver=1.0.1'"
@@ -31,6 +26,8 @@ func main() {
 	// katalog danych aplikacji (logi, config)
 	appDir := mustAppDataDir("pcm2www")
 	log := logs.New(filepath.Join(appDir, "app.log"))
+
+	log.Info().Msg("Aplikacja uruchomiona")
 
 	cfgPath := filepath.Join(appDir, "config.json")
 	cfg, firstRun, err := conf.LoadOrCreate(cfgPath)

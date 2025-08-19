@@ -1,3 +1,23 @@
-.aider*
 .env
-downloaded_images/
+
+# Go
+bin/
+dist/
+*.exe
+*.dll
+*.test
+*.out
+
+# IDE
+.vscode/
+.idea/
+
+# Build artifacts
+coverage.out
+
+# App data (jeśli czasem wrzucasz)
+app.log
+config.json
+
+# Windows explorer
+Thumbs.db
