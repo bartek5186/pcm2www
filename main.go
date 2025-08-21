@@ -1,3 +1,5 @@
+//go:build windows && !dev
+
 package main
 
 import (
@@ -12,18 +14,18 @@ import (
 	"syscall"
 	"time"
 
-	conf logs "github.com/bartek5186/pcm2www/internal"
+	conf "github.com/bartek5186/pcm2www/internal/config"
+	logs "github.com/bartek5186/pcm2www/internal/logs"
+	syncer "github.com/bartek5186/pcm2www/internal/syncer"
 	"github.com/getlantern/systray"
 )
 
 //go:embed assets/favicon.ico
 var iconData []byte
 
-// wersję możesz nadpisać przez: -ldflags "-X 'main.ver=1.0.1'"
 var ver = "1.0.0"
 
 func main() {
-	// katalog danych aplikacji (logi, config)
 	appDir := mustAppDataDir("pcm2www")
 	log := logs.New(filepath.Join(appDir, "app.log"))
 
@@ -35,16 +37,14 @@ func main() {
 		panic(err)
 	}
 	if firstRun {
-		log.Infof("Utworzono domyślną konfigurację: %s", cfgPath)
+		log.Info().Msgf("Utworzono domyślną konfigurację: %s", cfgPath)
 	}
 
-	// kontekst sterujący życiem procesu (CTRL+C / zamknięcie sesji)
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
 	s := syncer.New(log, cfg)
 
-	// jeśli proces dostanie sygnał – zatrzymaj syncer i zamknij tray
 	go func() {
 		<-ctx.Done()
 		s.Stop()
@@ -52,7 +52,6 @@ func main() {
 	}()
 
 	systray.Run(func() {
-		// onReady
 		if len(iconData) > 0 {
 			systray.SetIcon(iconData)
 		}
@@ -70,14 +69,13 @@ func main() {
 		mAbout := systray.AddMenuItem(fmt.Sprintf("O programie (%s)", ver), "")
 		mQuit := systray.AddMenuItem("Wyjście", "Zamknij aplikację")
 
-		// AutoStart harmonogramu (nie mylić z autostartem Windows!)
 		if cfg.AutoStart {
 			if err := s.Start(ctx); err == nil {
 				mStart.Disable()
 				mStop.Enable()
 				systray.SetTooltip(fmt.Sprintf("PCM2WWW Sync %s — działa", ver))
 			} else {
-				log.Errorf("AutoStart nieudany: %v", err)
+				log.Error().Msgf("AutoStart nieudany: %v", err)
 				systray.SetTooltip(fmt.Sprintf("PCM2WWW Sync %s — błąd startu", ver))
 			}
 		}
@@ -87,7 +85,7 @@ func main() {
 				select {
 				case <-mStart.ClickedCh:
 					if err := s.Start(ctx); err != nil {
-						log.Errorf("Start error: %v", err)
+						log.Error().Msgf("Start error: %v", err)
 						systray.SetTooltip(fmt.Sprintf("PCM2WWW Sync %s — błąd startu", ver))
 						continue
 					}
@@ -110,18 +108,17 @@ func main() {
 				case <-mReload.ClickedCh:
 					newCfg, _, err := conf.LoadOrCreate(cfgPath)
 					if err != nil {
-						log.Errorf("Błąd reloadu: %v", err)
+						log.Error().Msgf("Błąd reloadu: %v", err)
 						continue
 					}
 					cfg = newCfg
 					s.UpdateConfig(cfg)
-					log.Infof("Konfiguracja przeładowana")
+					log.Info().Msg("Konfiguracja przeładowana")
 
 				case <-mAbout.ClickedCh:
-					log.Infof("PCM2WWW Sync %s | %s", ver, runtime.Version())
+					log.Info().Msgf("PCM2WWW Sync %s | %s", ver, runtime.Version())
 
 				case <-mQuit.ClickedCh:
-					// łagodne zamykanie
 					cancel()
 					s.Stop()
 					systray.Quit()
@@ -130,7 +127,6 @@ func main() {
 			}
 		}()
 	}, func() {
-		// onExit — daj chwilę loggerowi na flush (jeśli potrzebuje)
 		time.Sleep(50 * time.Millisecond)
 	})
 }
@@ -145,11 +141,9 @@ func mustAppDataDir(name string) string {
 	return p
 }
 
-// przenośne otwieranie plików/katalogów w domyślnej aplikacji
 func openInExplorer(path string) {
 	switch runtime.GOOS {
 	case "windows":
-		// "start" musi być uruchomiony przez cmd /C, z pustym tytułem okna ""
 		_ = exec.Command("cmd", "/C", "start", "", path).Start()
 	case "darwin":
 		_ = exec.Command("open", path).Start()
