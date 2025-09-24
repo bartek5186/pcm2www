@@ -11,6 +11,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -33,6 +34,47 @@ type Importer struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 	db     *gorm.DB
+}
+
+// minimalny model pod to, co potrzebujesz teraz
+type xmlMagazyn struct {
+	MagazynID  int64  `xml:"magazyn_id"`
+	Stan       string `xml:"stan_magazynu"`     // może być "", więc string
+	Rezerwacja string `xml:"rezerwacja_ilosci"` // jw.
+}
+
+// liczniki
+var (
+	seenTowar   int
+	insProducts int
+	insStocks   int
+)
+
+type xmlTowar struct {
+	TowarID     int64  `xml:"towar_id"`
+	Kod         string `xml:"kod"`
+	Nazwa       string `xml:"nazwa"`
+	Opis1       string `xml:"opis1"`
+	VatID       int64  `xml:"vat_id"`
+	KategoriaID string `xml:"kategoria_id"` // bywa puste → string
+	GrupaID     string `xml:"asortyment_id"`
+	JmID        int64  `xml:"jm_id"`
+
+	DoUsuniecia string `xml:"do_usuniecia"` // "Y"/"N"
+	AktywnyWSI  string `xml:"aktywny_w_SI"` // "Y"/"N"
+
+	CenaDetal     string `xml:"cena_detal"`
+	CenaHurtowa   string `xml:"cena_hurtowa"`
+	CenaNocna     string `xml:"cena_nocna"`
+	CenaDodatkowa string `xml:"cena_dodatkowa"`
+	CenaDetPrzed  string `xml:"cena_detal_przed_prom"`
+	NajCena30Det  string `xml:"najnizsza_cena_30_dni_detal,omitempty"` // jeśli masz w eksporcie
+
+	FolderZdjec      string `xml:"folder_zdjec"`
+	PlikZdjecia      string `xml:"plik_zdjecia"`
+	DataAktualizacji string `xml:"data_aktualizacji"`
+
+	Magazyny []xmlMagazyn `xml:"magazyny>magazyn"`
 }
 
 func (i *Importer) Name() string { return "importer" }
@@ -104,15 +146,28 @@ func (i *Importer) scanOnce(dir string) {
 			i.log.Error().Err(err).Str("file", name).Msg("rejestracja pliku nieudana")
 			continue
 		}
+
 		if already {
-			i.log.Debug().Str("file", name).Msg("plik już był – pomijam")
-			continue
+			// sprawdź status — jeśli != done (1), to reprocess
+			var rec db.ImportFile
+			if err := i.db.Where("import_id = ?", importID).Take(&rec).Error; err == nil {
+				if rec.Status != 1 {
+					i.log.Warn().Str("file", name).Uint("import_id", importID).
+						Int("status", rec.Status).Msg("plik istnieje, ale nie DONE — ponawiam przetwarzanie")
+					// leć dalej do processFile
+				} else {
+					i.log.Debug().Str("file", name).Msg("plik już był i DONE — pomijam")
+					continue
+				}
+			} else {
+				// nie znalazłem? przetwarzaj ostrożnie
+				i.log.Warn().Str("file", name).Msg("brak rekordu import_files dla istniejącego pliku — przetwarzam")
+			}
 		}
 
-		// przetwarzaj
+		// PRZETWARZANIE
 		if err := i.processFile(importID, full); err != nil {
-			i.log.Error().Err(err).Str("file", name).Msg("błąd przetwarzania pliku")
-			// status=error, pliku nie usuwamy
+			i.log.Error().Err(err).Str("file", name).Uint("import_id", importID).Msg("błąd przetwarzania pliku")
 			_ = i.db.Model(&db.ImportFile{}).Where("import_id = ?", importID).
 				Updates(map[string]any{"status": 2, "last_error": err.Error()})
 			continue
@@ -179,30 +234,49 @@ func (i *Importer) processFile(importID uint, fullPath string) error {
 	}
 	defer f.Close()
 
-	// Buforowany reader (bezpieczniej dla detekcji nagłówka i filtrów znakowych)
+	// Buforowany reader + dekoder z obsługą charsetów
 	br := bufio.NewReader(f)
 	dec := xml.NewDecoder(br)
-
 	dec.CharsetReader = func(cs string, in io.Reader) (io.Reader, error) {
-		// mapujemy „Latin II” → „iso-8859-2”, itp.
 		return charset.NewReaderLabel(normalizeCharset(cs), in)
 	}
 
-	// PRZYKŁAD: czytamy tylko <dane>/<transmisja_id> i liczymy towarów,
-	// w praktyce tutaj wstawiasz pełny parsing sekcji i batch insert do st_* tabel
-	type daneHeader struct {
-		TransmisjaID string `xml:"transmisja_id"`
-	}
-	var (
-		//inWykazy bool
-		prodCnt int
-	)
-	tx := i.db.Begin()
-	defer func() {
-		if r := recover(); r != nil {
-			tx.Rollback()
+	const batchSize = 500
+	prodBatch := make([]db.StProduct, 0, batchSize)
+	stockBatch := make([]db.StStock, 0, batchSize)
+
+	insProducts, insStocks := 0, 0
+
+	flushBatches := func(tx *gorm.DB) error {
+		if len(prodBatch) > 0 {
+			if err := tx.Create(&prodBatch).Error; err != nil {
+				i.log.Error().Err(err).Int("n", len(prodBatch)).Msg("insert st_products batch failed")
+				return err
+			}
+			insProducts += len(prodBatch)
+			prodBatch = prodBatch[:0]
 		}
-	}()
+		if len(stockBatch) > 0 {
+			if err := tx.Create(&stockBatch).Error; err != nil {
+				i.log.Error().Err(err).Int("n", len(stockBatch)).Msg("insert st_stock batch failed")
+				return err
+			}
+			insStocks += len(stockBatch)
+			stockBatch = stockBatch[:0]
+		}
+		return nil
+	}
+
+	tx := i.db.Begin()
+	defer tx.Rollback()
+
+	// wyczyść staging dla tego importu (idempotentnie)
+	if err := tx.Where("import_id = ?", importID).Delete(&db.StStock{}).Error; err != nil {
+		return err
+	}
+	if err := tx.Where("import_id = ?", importID).Delete(&db.StProduct{}).Error; err != nil {
+		return err
+	}
 
 	for {
 		tok, err := dec.Token()
@@ -210,44 +284,99 @@ func (i *Importer) processFile(importID uint, fullPath string) error {
 			break
 		}
 		if err != nil {
-			tx.Rollback()
 			return err
 		}
 
 		switch se := tok.(type) {
 		case xml.StartElement:
-			if se.Name.Local == "dane" {
-				var d daneHeader
-				if err := dec.DecodeElement(&d, &se); err != nil {
-					tx.Rollback()
+			// 1) tylko <transmisja_id> – nie połykać całego <dane>
+			if strings.EqualFold(se.Name.Local, "transmisja_id") {
+				var tid string
+				if err := dec.DecodeElement(&tid, &se); err != nil {
 					return err
 				}
-				// ewentualna aktualizacja transmisja_id jeśli nie było
-				if d.TransmisjaID != "" {
+				tid = strings.TrimSpace(tid)
+				if tid != "" {
 					_ = tx.Model(&db.ImportFile{}).
 						Where("import_id = ?", importID).
-						Update("transmisja_id", d.TransmisjaID).Error
+						Update("transmisja_id", tid).Error
 				}
-			} else if se.Name.Local == "towar" {
-				// TODO: DecodeElement → db.StProduct (INSERT)
-				// na razie licznik:
-				prodCnt++
-			} else if se.Name.Local == "magazyn_stan" {
-				// TODO: wstaw do st_stock
-			} else if se.Name.Local == "wykazy" {
-				//inWykazy = true
+				continue
 			}
-		case xml.EndElement:
-			if se.Name.Local == "wykazy" {
-				//inWykazy = false
+
+			// 2) <towary> – zdekoduj całą listę <towar>
+			if strings.EqualFold(se.Name.Local, "towary") {
+				var tw struct {
+					Items []xmlTowar `xml:"towar"`
+				}
+				if err := dec.DecodeElement(&tw, &se); err != nil {
+					return err
+				}
+
+				for _, t := range tw.Items {
+					// produkt → st_products (batch)
+					prodBatch = append(prodBatch, db.StProduct{
+						ImportID:         importID,
+						TowarID:          t.TowarID,
+						Kod:              strings.TrimSpace(t.Kod),
+						Nazwa:            strings.TrimSpace(t.Nazwa),
+						Opis1:            t.Opis1,
+						VatID:            t.VatID,
+						KategoriaID:      i64(t.KategoriaID),
+						GrupaID:          i64(t.GrupaID),
+						JmID:             t.JmID,
+						CenaDetal:        f64(t.CenaDetal),
+						CenaHurtowa:      f64(t.CenaHurtowa),
+						CenaNocna:        f64(t.CenaNocna),
+						CenaDodatkowa:    f64(t.CenaDodatkowa),
+						CenaDetPrzedProm: f64(t.CenaDetPrzed),
+						NajCena30Det:     f64(t.NajCena30Det),
+						AktywnyWSI:       yn(t.AktywnyWSI),
+						DoUsuniecia:      yn(t.DoUsuniecia),
+						DataAktualizacji: t.DataAktualizacji,
+						FolderZdjec:      t.FolderZdjec,
+						PlikZdjecia:      t.PlikZdjecia,
+					})
+
+					// stany → st_stock (batch)
+					for _, m := range t.Magazyny {
+						stockBatch = append(stockBatch, db.StStock{
+							ImportID:   importID,
+							TowarID:    t.TowarID,
+							MagazynID:  m.MagazynID,
+							Stan:       f64(m.Stan),
+							Rezerwacja: f64(m.Rezerwacja),
+						})
+					}
+
+					// okresowy flush
+					if len(prodBatch) >= batchSize || len(stockBatch) >= batchSize {
+						if err := flushBatches(tx); err != nil {
+							return err
+						}
+					}
+				}
+				continue
 			}
+
+			// inne sekcje na razie pomijamy
 		}
 	}
 
-	if err := tx.Commit().Error; err != nil {
+	// flush resztek i commit
+	if err := flushBatches(tx); err != nil {
 		return err
 	}
-	i.log.Info().Uint("import_id", importID).Int("products_seen", prodCnt).Msg("XML parsed (stub)")
+	if err := tx.Commit().Error; err != nil {
+		i.log.Error().Err(err).Msg("tx commit failed")
+		return err
+	}
+
+	i.log.Info().
+		Uint("import_id", importID).
+		Int("products_inserted", insProducts).
+		Int("stocks_inserted", insStocks).
+		Msg("XML parsed → staging OK")
 	return nil
 }
 
@@ -336,4 +465,33 @@ func normalizeCharset(cs string) string {
 	default:
 		return c
 	}
+}
+
+func yn(s string) bool {
+	switch strings.TrimSpace(strings.ToUpper(s)) {
+	case "Y", "T", "1", "TAK":
+		return true
+	default:
+		return false
+	}
+}
+
+func f64(s string) float64 {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return 0
+	}
+	// zamień ewentualny przecinek na kropkę
+	s = strings.ReplaceAll(s, ",", ".")
+	v, _ := strconv.ParseFloat(s, 64)
+	return v
+}
+
+func i64(s string) int64 {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return 0
+	}
+	v, _ := strconv.ParseInt(s, 10, 64)
+	return v
 }

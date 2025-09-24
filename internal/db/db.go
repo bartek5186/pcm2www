@@ -14,9 +14,15 @@ type Handle struct {
 
 func OpenAt(dir string) (*Handle, error) {
 	dbPath := filepath.Join(dir, "pcm2www.db")
-	gdb, err := gorm.Open(sqlite.Open(dbPath), &gorm.Config{
+	gdb, err := gorm.Open(sqlite.Open(dbPath+"?_busy_timeout=5000&_journal_mode=WAL"), &gorm.Config{
 		// Logger: logger.Default.LogMode(logger.Info), // włącz jeśli chcesz verbose SQL
 	})
+
+	sqlDB, _ := gdb.DB()
+	sqlDB.SetMaxOpenConns(1)
+	sqlDB.SetMaxIdleConns(1)
+	sqlDB.SetConnMaxLifetime(0)
+
 	if err != nil {
 		return nil, err
 	}

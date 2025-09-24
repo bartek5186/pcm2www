@@ -33,6 +33,8 @@ func main() {
 		log.Fatal().Err(err).Msg("DB migrate error")
 	}
 	log.Info().Str("db", dbh.Path).Msg("DB ready")
+	sqlDB, _ := dbh.DB.DB()
+	defer sqlDB.Close()
 
 	log.Info().Msg("Aplikacja (CLI) uruchomiona")
 

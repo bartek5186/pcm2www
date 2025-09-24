@@ -40,6 +40,8 @@ func main() {
 	log.Info().Str("db", dbh.Path).Msg("DB ready")
 
 	log.Info().Msg("Aplikacja uruchomiona")
+	sqlDB, _ := dbh.DB.DB()
+	defer sqlDB.Close()
 
 	cfgPath := filepath.Join(appDir, "config.json")
 	cfg, firstRun, err := conf.LoadOrCreate(cfgPath)
