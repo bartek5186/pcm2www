@@ -8,9 +8,11 @@ import (
 	"time"
 
 	conf "github.com/bartek5186/pcm2www/internal/config"
-	"github.com/bartek5186/pcm2www/internal/integrations"               // + import rejestru/typów
+	"github.com/bartek5186/pcm2www/internal/integrations" // + import rejestru/typów
+	_ "github.com/bartek5186/pcm2www/internal/integrations/importer"
 	_ "github.com/bartek5186/pcm2www/internal/integrations/woocommerce" // rejestracja
 	"github.com/rs/zerolog"
+	"gorm.io/gorm"
 )
 
 type runningInt struct {
@@ -20,6 +22,7 @@ type runningInt struct {
 
 type Syncer struct {
 	log     zerolog.Logger
+	db      *gorm.DB
 	mu      sync.Mutex
 	cfg     *conf.Config
 	running bool
@@ -30,8 +33,8 @@ type Syncer struct {
 	ints []runningInt
 }
 
-func New(log zerolog.Logger, cfg *conf.Config) *Syncer {
-	return &Syncer{log: log, cfg: cfg}
+func New(log zerolog.Logger, cfg *conf.Config, gdb *gorm.DB) *Syncer {
+	return &Syncer{log: log, cfg: cfg, db: gdb}
 }
 
 func (s *Syncer) Start(ctx context.Context) error {
@@ -59,6 +62,7 @@ func (s *Syncer) Start(ctx context.Context) error {
 		s.wg.Add(1)
 		go func(intg integrations.Integration) {
 			defer s.wg.Done()
+			ctx = context.WithValue(ctx, "gormDB", s.db)
 			if err := intg.Start(ctx); err != nil {
 				s.log.Error().Err(err).Str("integration", intg.Name()).Msg("zakończona z błędem")
 			}
@@ -70,9 +74,13 @@ func (s *Syncer) Start(ctx context.Context) error {
 func (s *Syncer) buildIntegrationsLocked() []runningInt {
 	var out []runningInt
 	if s.cfg == nil || len(s.cfg.Integrations) == 0 {
+		s.log.Warn().Msg("Integrations: brak lub puste (sprawdź config.json)")
 		return out
 	}
+	s.log.Info().Int("count", len(s.cfg.Integrations)).Msg("Integrations in config")
 	for name, raw := range s.cfg.Integrations {
+		s.log.Info().Str("integration", name).RawJSON("raw", raw).Msg("Found integration in config")
+
 		f, ok := integrations.Get(name)
 		if !ok {
 			s.log.Warn().Str("integration", name).Msg("brak fabryki – pomijam")
@@ -85,6 +93,7 @@ func (s *Syncer) buildIntegrationsLocked() []runningInt {
 		}
 		out = append(out, runningInt{Name: name, Inst: inst})
 	}
+	s.log.Info().Int("started", len(out)).Msg("Integrations built")
 	return out
 }
 

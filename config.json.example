@@ -1,10 +1,17 @@
 {
-  "integration": "woocommerce",
-  "woocommerce": {
-    "site": "https://shop.domain",
-    "user": "USER",
-    "key": "API_KEY"
+  "integrations": {
+    "woocommerce": {
+      "base_url": "",
+      "username": "",
+      "consumer_key": "ck_xxx",
+      "consumer_secret": "GGoO .... ....",
+      "poll_sec": 10
+    },
+    "importer": {
+      "watch_dir": "~/pcm2www/imports",
+      "poll_sec": 5
+    }
   },
   "auto_start": true,
-  "sync_interval_seconds": 60
+  "sync_interval_seconds": 10
 }

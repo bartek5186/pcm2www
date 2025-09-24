@@ -15,6 +15,7 @@ import (
 	"time"
 
 	conf "github.com/bartek5186/pcm2www/internal/config"
+	"github.com/bartek5186/pcm2www/internal/db"
 	logs "github.com/bartek5186/pcm2www/internal/logs"
 	syncer "github.com/bartek5186/pcm2www/internal/syncer"
 	"github.com/getlantern/systray"
@@ -27,7 +28,16 @@ var ver = "1.0.0"
 
 func main() {
 	appDir := mustAppDataDir("pcm2www")
-	log := logs.New(filepath.Join(appDir, "app.log"))
+	log := logs.New(filepath.Join(appDir, "app.log"), false)
+
+	dbh, err := db.OpenAt(appDir)
+	if err != nil {
+		log.Fatal().Err(err).Msg("DB open error")
+	}
+	if err := dbh.Migrate(); err != nil {
+		log.Fatal().Err(err).Msg("DB migrate error")
+	}
+	log.Info().Str("db", dbh.Path).Msg("DB ready")
 
 	log.Info().Msg("Aplikacja uruchomiona")
 
@@ -43,7 +53,7 @@ func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
-	s := syncer.New(log, cfg)
+	s := syncer.New(log, cfg, dbh.DB)
 
 	go func() {
 		<-ctx.Done()
