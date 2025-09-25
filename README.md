@@ -26,7 +26,6 @@ Plik konfiguracyjny wrzucamy w ~/.config/pcm2www/config.json
   "integrations": {
     "woocommerce": {
       "base_url": "https://new...",
-      "username": "bartek5186",
       "consumer_key": "ck_xxx",
       "consumer_secret": "GGoO .... .... .... ....",
       "poll_sec": 10,
@@ -66,7 +65,6 @@ Integracja składa się z trzech głównych sekcji:
 ### Połączenie z API
 
 - **base_url** – adres sklepu WooCommerce (REST API).  
-- **username** – nazwa użytkownika integracyjnego WooCommerce.  
 - **consumer_key** i **consumer_secret** – klucze API wygenerowane w WooCommerce (używane do autoryzacji).  
 - **poll_sec** – częstotliwość sprawdzania kolejki zadań dla WooCommerce, tutaj co **10 sekund**.
 

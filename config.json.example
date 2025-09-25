@@ -2,7 +2,6 @@
   "integrations": {
     "woocommerce": {
       "base_url": "https://…",
-      "username": "Username",
       "consumer_key": "ck_xxx",
       "consumer_secret": "GGoO .... ....",
       "poll_sec": 10,

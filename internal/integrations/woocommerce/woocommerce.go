@@ -22,7 +22,6 @@ type WooCache struct {
 
 type Config struct {
 	BaseURL     string   `json:"base_url"` // https://shop.example.com
-	Username    string   `json:"username"` // opcjonalnie: dla opisu/logów albo Basic Auth
 	ConsumerKey string   `json:"consumer_key"`
 	ConsumerSec string   `json:"consumer_secret"`
 	PollSec     int      `json:"poll_sec"` // co ile sekund sprawdzać (dev)
