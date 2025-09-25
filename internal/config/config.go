@@ -22,7 +22,6 @@ type Config struct {
 // Przykładowy config integracji WooCommerce (używany do domyślnego JSON-a)
 type WooDefaults struct {
 	BaseURL     string               `json:"base_url"`
-	Username    string               `json:"username"`
 	ConsumerKey string               `json:"consumer_key"`
 	ConsumerSec string               `json:"consumer_secret"`
 	PollSec     int                  `json:"poll_sec"`
@@ -39,15 +38,13 @@ func LoadOrCreate(path string) (*Config, bool, error) {
 			// domyślny config
 			woo := WooDefaults{
 				BaseURL:     "https://example.com",
-				Username:    "admin@example.com",
 				ConsumerKey: "ck_xxx",
 				ConsumerSec: "cs_xxx",
 				PollSec:     10,
 				Cache: woocommerce.WooCache{
-					PrimeOnStart:          true,
-					SweepIntervalMinutes:  360, //6h
-					SweepStockOnlyMinutes: 120, //2h
-					Fields:                "id,sku,name,regular_price,sale_price,stock_quantity,manage_stock,status,date_modified_gmt",
+					PrimeOnStart:         true,
+					SweepIntervalMinutes: 360, //6h
+					Fields:               "id,sku,name,regular_price,sale_price,stock_quantity,manage_stock,status,date_modified_gmt",
 				},
 			}
 			rawWoo, _ := json.Marshal(woo)

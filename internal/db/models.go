@@ -80,6 +80,17 @@ type WooTask struct {
 }
 
 // internal/db/models.go
+type LinkIssue struct {
+	ID        uint      `gorm:"primaryKey"`
+	ImportID  uint      `gorm:"index"`
+	TowarID   int64     `gorm:"index"`
+	Kod       string    `gorm:"index"` // potencjalnie EAN/SKU ze stagingu
+	Reason    string    `gorm:"index"` // missing_ean_src, missing_ean_shop, duplicate_ean_shop, duplicate_candidate, ambiguous
+	Details   string    `gorm:"type:text"`
+	CreatedAt time.Time `gorm:"autoCreateTime"`
+}
+
+// internal/db/models.go
 type KV struct {
 	K string `gorm:"primaryKey"`
 	V string

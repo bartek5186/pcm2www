@@ -173,6 +173,11 @@ func (i *Importer) scanOnce(dir string) {
 			continue
 		}
 
+		if err := i.LinkProductsByEAN(importID); err != nil {
+			i.log.Error().Err(err).Uint("import_id", importID).Msg("linking failed")
+			// nadal możesz ustawić status=1 na ImportFile, ale warto zostawić warning
+		}
+
 		// sukces: status=1, processed_at=now
 		now := time.Now()
 		_ = i.db.Model(&db.ImportFile{}).Where("import_id = ?", importID).
@@ -182,6 +187,7 @@ func (i *Importer) scanOnce(dir string) {
 		// _ = os.Remove(full)
 		i.log.Info().Str("file", name).Uint("import_id", importID).Msg("przetworzono OK")
 	}
+
 }
 
 func (i *Importer) registerFile(fullPath, name string) (uint, bool, error) {

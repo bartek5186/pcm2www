@@ -31,8 +31,7 @@ Plik konfiguracyjny wrzucamy w ~/.config/pcm2www/config.json
       "poll_sec": 10,
       "cache": {
         "prime_on_start": true,
-        "sweep_interval_minutes": 360,
-        "sweep_stock_only_minutes": 120,
+        "sweep_interval_minutes": 360
         "fields": "id,sku,name,regular_price,sale_price,stock_quantity,manage_stock,status,hurt_price,ean,date_modified_gmt,type"
       }
     },
@@ -74,7 +73,6 @@ Sekcja `cache` określa sposób buforowania danych produktów z WooCommerce:
 
 - **prime_on_start** – przy pierwszym uruchomieniu pobierany jest pełny stan produktów z Woo (pełna inicjalizacja cache).  
 - **sweep_interval_minutes** – pełne odświeżanie cache produktów co **360 minut (6h)**.  
-- **sweep_stock_only_minutes** – odświeżanie tylko stanów magazynowych co **120 minut (2h)**.  
 - **fields** – lista pól produktów pobieranych z WooCommerce:  
   - id, sku – identyfikatory  
   - name – nazwa produktu  

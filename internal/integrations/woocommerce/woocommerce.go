@@ -14,10 +14,9 @@ import (
 )
 
 type WooCache struct {
-	PrimeOnStart          bool   `json:"prime_on_start"`
-	SweepIntervalMinutes  int    `json:"sweep_interval_minutes"`
-	SweepStockOnlyMinutes int    `json:"sweep_stock_only_minutes"`
-	Fields                string `json:"fields"`
+	PrimeOnStart         bool   `json:"prime_on_start"`
+	SweepIntervalMinutes int    `json:"sweep_interval_minutes"`
+	Fields               string `json:"fields"`
 }
 
 type Config struct {

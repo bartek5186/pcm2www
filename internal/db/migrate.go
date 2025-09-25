@@ -10,5 +10,6 @@ func (h *Handle) Migrate() error {
 		&WooProductCache{},
 		&WooTask{},
 		&KV{},
+		&LinkIssue{},
 	)
 }
