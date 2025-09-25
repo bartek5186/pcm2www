@@ -1,11 +1,17 @@
 {
   "integrations": {
     "woocommerce": {
-      "base_url": "",
-      "username": "",
+      "base_url": "https://…",
+      "username": "Username",
       "consumer_key": "ck_xxx",
       "consumer_secret": "GGoO .... ....",
-      "poll_sec": 10
+      "poll_sec": 10,
+      "cache": {
+        "prime_on_start": true,
+        "sweep_interval_minutes": 360,
+        "sweep_stock_only_minutes": 120,
+        "fields": "id,sku,name,regular_price,sale_price,stock_quantity,manage_stock,status,hurt_price,ean,date_modified_gmt,type"
+      }
     },
     "importer": {
       "watch_dir": "~/pcm2www/imports",

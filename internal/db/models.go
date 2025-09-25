@@ -55,6 +55,7 @@ type WooProductCache struct {
 	WooID        uint   `gorm:"primaryKey"`
 	TowarID      *int64 `gorm:"index"`
 	Kod          string `gorm:"index"` // SKU
+	Ean          string `gorm:"index"`
 	Name         string
 	PriceRegular float64
 	PriceSale    float64
@@ -62,6 +63,8 @@ type WooProductCache struct {
 	StockQty     float64
 	StockManaged bool
 	Status       string // publish/draft/trash
+	Type         string
+	DateModified string
 }
 
 // woo_tasks

@@ -32,9 +32,12 @@ func (w *Woo) primeCache(ctx context.Context, gdb *gorm.DB) error {
 	for {
 
 		q := base.Query()
+		q.Set("orderby", "modified")
+		q.Set("order", "desc")
 		q.Set("per_page", strconv.Itoa(perPage))
 		q.Set("page", strconv.Itoa(page))
-		q.Set("_fields", "id,sku,name,regular_price,sale_price,stock_quantity,manage_stock,status,hurt_price")
+
+		q.Set("_fields", w.cfg.Cache.Fields)
 
 		base.RawQuery = q.Encode()
 
@@ -102,6 +105,7 @@ func (w *Woo) primeCache(ctx context.Context, gdb *gorm.DB) error {
 				WooID:        uint(p.ID),
 				TowarID:      nil, // nie znamy jeszcze mapowania z PCM – zostanie uzupełnione później
 				Kod:          p.SKU,
+				Ean:          p.EAN,
 				Name:         p.Name,
 				PriceRegular: parsePrice(p.RegularPrice),
 				PriceSale:    parsePrice(p.SalePrice),
@@ -109,6 +113,8 @@ func (w *Woo) primeCache(ctx context.Context, gdb *gorm.DB) error {
 				StockQty:     p.StockQty,
 				StockManaged: p.ManageStock,
 				Status:       p.Status,
+				Type:         p.Type,
+				DateModified: p.DateModified,
 			})
 		}
 
@@ -116,7 +122,7 @@ func (w *Woo) primeCache(ctx context.Context, gdb *gorm.DB) error {
 			Columns: []clause.Column{{Name: "woo_id"}}, // klucz unikalny
 			DoUpdates: clause.AssignmentColumns([]string{
 				"kod", "name", "price_regular", "price_sale", "hurt_price",
-				"stock_qty", "stock_managed", "status",
+				"stock_qty", "stock_managed", "status", "ean", "type", "date_modified",
 			}),
 		}).Create(&rows).Error; err != nil {
 			return fmt.Errorf("upsert cache page %d: %w", page, err)

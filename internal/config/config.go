@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+
+	"github.com/bartek5186/pcm2www/internal/integrations/woocommerce"
 )
 
 // Główny config aplikacji
@@ -19,11 +21,12 @@ type Config struct {
 
 // Przykładowy config integracji WooCommerce (używany do domyślnego JSON-a)
 type WooDefaults struct {
-	BaseURL     string `json:"base_url"`
-	Username    string `json:"username"`
-	ConsumerKey string `json:"consumer_key"`
-	ConsumerSec string `json:"consumer_secret"`
-	PollSec     int    `json:"poll_sec"`
+	BaseURL     string               `json:"base_url"`
+	Username    string               `json:"username"`
+	ConsumerKey string               `json:"consumer_key"`
+	ConsumerSec string               `json:"consumer_secret"`
+	PollSec     int                  `json:"poll_sec"`
+	Cache       woocommerce.WooCache `json:"cache"`
 }
 
 func LoadOrCreate(path string) (*Config, bool, error) {
@@ -40,6 +43,12 @@ func LoadOrCreate(path string) (*Config, bool, error) {
 				ConsumerKey: "ck_xxx",
 				ConsumerSec: "cs_xxx",
 				PollSec:     10,
+				Cache: woocommerce.WooCache{
+					PrimeOnStart:          true,
+					SweepIntervalMinutes:  360, //6h
+					SweepStockOnlyMinutes: 120, //2h
+					Fields:                "id,sku,name,regular_price,sale_price,stock_quantity,manage_stock,status,date_modified_gmt",
+				},
 			}
 			rawWoo, _ := json.Marshal(woo)
 
