@@ -78,3 +78,9 @@ type WooTask struct {
 	LastError   string    `gorm:"type:text"`
 	CreatedAt   time.Time `gorm:"autoCreateTime"`
 }
+
+// internal/db/models.go
+type KV struct {
+	K string `gorm:"primaryKey"`
+	V string
+}

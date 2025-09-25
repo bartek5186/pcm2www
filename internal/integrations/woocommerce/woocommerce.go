@@ -52,9 +52,15 @@ func (w *Woo) Start(ctx context.Context) error {
 	}
 
 	// 1) PRIME CACHE — jednorazowo przy starcie
-	if err := w.primeCache(ctx, gdb); err != nil {
-		w.log.Error().Err(err).Msg("prime cache failed")
-		// nie przerywam całej integracji – ale warto zalogować
+	if w.cfg.Cache.PrimeOnStart {
+		if err := w.primeCache(ctx, gdb); err != nil {
+			w.log.Error().Err(err).Msg("prime cache failed")
+			// nie przerywam całej integracji – ale warto zalogować
+		}
+	}
+
+	if w.cfg.Cache.SweepIntervalMinutes > 0 {
+		go w.runCacheSweeper(w.ctx, gdb)
 	}
 
 	// 2) odpal worker zadań (jeśli już masz woo_tasks)

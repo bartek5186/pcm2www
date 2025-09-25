@@ -9,5 +9,6 @@ func (h *Handle) Migrate() error {
 		&StStock{},
 		&WooProductCache{},
 		&WooTask{},
+		&KV{},
 	)
 }

@@ -3,6 +3,16 @@
 Ten plik konfiguracyjny opisuje integrację systemu **PC-Market 7 (PCM)** poprzez narzędzie **pcm2www** z platformą **WooCommerce**.  
 Integrator działa cyklicznie, pobiera dane z katalogu eksportów PC-Market (`exp_*`) oraz synchronizuje je z WooCommerce przy użyciu REST API.
 
+## Funkcjonalności
+
+- 🚀 **Automatyczna synchronizacja** produktów i stanów magazynowych  
+- 🔄 **Obsługa cache** – pełne i częściowe odświeżanie danych z WooCommerce  
+- 🗂️ **Import plików PCM** (`exp_wyk`, `exp_dok`, itp.) z katalogu wymiany  
+- 🛒 **Integracja przez REST API** WooCommerce (create, update, stock update)  
+- ⚙️ **Elastyczna konfiguracja** poprzez plik JSON
+- 📡 **Ciągła praca w tle** – monitoring katalogu i cykliczne taski
+
+---
 Integrator posiada narzędzie CLI, tak samo jak narzędzie Desktopowe (Windows)
 Plik konfiguracyjny wrzucamy w ~/.config/pcm2www/config.json
 
