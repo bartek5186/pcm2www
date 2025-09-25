@@ -53,11 +53,12 @@ type StStock struct {
 // woo_products_cache
 type WooProductCache struct {
 	WooID        uint   `gorm:"primaryKey"`
-	TowarID      int64  `gorm:"uniqueIndex"`
+	TowarID      *int64 `gorm:"index"`
 	Kod          string `gorm:"index"` // SKU
 	Name         string
 	PriceRegular float64
 	PriceSale    float64
+	HurtPrice    float64
 	StockQty     float64
 	StockManaged bool
 	Status       string // publish/draft/trash

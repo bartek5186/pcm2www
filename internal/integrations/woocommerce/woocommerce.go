@@ -4,11 +4,13 @@ package woocommerce
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"time"
 
 	"github.com/bartek5186/pcm2www/internal/integrations"
 	"github.com/rs/zerolog"
+	"gorm.io/gorm"
 )
 
 type Config struct {
@@ -34,10 +36,25 @@ func (w *Woo) Start(ctx context.Context) error {
 	w.ctx, w.cancel = context.WithCancel(ctx)
 	w.log.Info().Str("integration", w.Name()).Msg("start")
 
+	// weź *gorm.DB z kontekstu (tak, jak w importerze)
+	raw := ctx.Value("gormDB")
+	gdb, _ := raw.(*gorm.DB)
+	if gdb == nil {
+		return fmt.Errorf("woocommerce: brak *gorm.DB w kontekście")
+	}
+
+	// 1) PRIME CACHE — jednorazowo przy starcie
+	if err := w.primeCache(ctx, gdb); err != nil {
+		w.log.Error().Err(err).Msg("prime cache failed")
+		// nie przerywam całej integracji – ale warto zalogować
+	}
+
+	// 2) odpal worker zadań (jeśli już masz woo_tasks)
+	//go w.runWorker(w.ctx, gdb)
+
+	// 3) dev ping/ticker (jak miałeś)
 	ticker := time.NewTicker(w.interval())
 	defer ticker.Stop()
-
-	// pierwszy strzał
 	w.tick()
 
 	for {
@@ -47,7 +64,6 @@ func (w *Woo) Start(ctx context.Context) error {
 			return nil
 		case <-ticker.C:
 			w.tick()
-			// jeśli ktoś zmieni PollSec w locie → odśwież
 			ticker.Reset(w.interval())
 		}
 	}
