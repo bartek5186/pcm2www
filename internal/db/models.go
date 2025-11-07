@@ -21,9 +21,9 @@ type ImportFile struct {
 
 // st_products (staging)
 type StProduct struct {
-	ImportID         uint   `gorm:"primaryKey"`
-	TowarID          int64  `gorm:"primaryKey"`
-	Kod              string `gorm:"index"`
+	ID               uint   `gorm:"primaryKey;autoIncrement"`
+	TowarID          int64  `gorm:"uniqueIndex:uniq_towar_kod"`
+	Kod              string `gorm:"uniqueIndex:uniq_towar_kod"`
 	Nazwa            string
 	Opis1            string
 	VatID            int64
@@ -41,15 +41,19 @@ type StProduct struct {
 	DataAktualizacji string
 	FolderZdjec      string
 	PlikZdjecia      string
+	ImportID         uint `gorm:"index"` // ostatni import, który zaktualizował rekord
+	UpdatedAt        time.Time
 }
 
 // st_stock (staging)
 type StStock struct {
-	ImportID   uint  `gorm:"primaryKey"`
-	TowarID    int64 `gorm:"primaryKey"`
-	MagazynID  int64 `gorm:"primaryKey"`
+	ID         uint  `gorm:"primaryKey;autoIncrement"`
+	TowarID    int64 `gorm:"uniqueIndex:uniq_towar_mag"`
+	MagazynID  int64 `gorm:"uniqueIndex:uniq_towar_mag"`
 	Stan       float64
 	Rezerwacja float64
+	ImportID   uint `gorm:"index"`
+	UpdatedAt  time.Time
 }
 
 // woo_products_cache

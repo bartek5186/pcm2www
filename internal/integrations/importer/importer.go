@@ -20,6 +20,7 @@ import (
 	"github.com/rs/zerolog"
 	"golang.org/x/net/html/charset"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 type Config struct {
@@ -243,14 +244,12 @@ func (i *Importer) registerFile(fullPath, name string) (uint, bool, error) {
 }
 
 func (i *Importer) processFile(importID uint, fullPath string) error {
-	// stream-parse XML → staging
 	f, err := os.Open(fullPath)
 	if err != nil {
 		return err
 	}
 	defer f.Close()
 
-	// Buforowany reader + dekoder z obsługą charsetów
 	br := bufio.NewReader(f)
 	dec := xml.NewDecoder(br)
 	dec.CharsetReader = func(cs string, in io.Reader) (io.Reader, error) {
@@ -261,37 +260,66 @@ func (i *Importer) processFile(importID uint, fullPath string) error {
 	prodBatch := make([]db.StProduct, 0, batchSize)
 	stockBatch := make([]db.StStock, 0, batchSize)
 
+	tx := i.db.Begin()
+	defer tx.Rollback()
+
 	insProducts, insStocks := 0, 0
 
+	// ✅ Upsert w batchach
 	flushBatches := func(tx *gorm.DB) error {
+		// ---- produkty ----
 		if len(prodBatch) > 0 {
-			if err := tx.Create(&prodBatch).Error; err != nil {
-				i.log.Error().Err(err).Int("n", len(prodBatch)).Msg("insert st_products batch failed")
+			err := tx.Clauses(clause.OnConflict{
+				Columns: []clause.Column{{Name: "towar_id"}, {Name: "kod"}},
+				DoUpdates: clause.Assignments(map[string]interface{}{
+					"nazwa":               gorm.Expr("excluded.nazwa"),
+					"opis1":               gorm.Expr("excluded.opis1"),
+					"vat_id":              gorm.Expr("excluded.vat_id"),
+					"kategoria_id":        gorm.Expr("excluded.kategoria_id"),
+					"grupa_id":            gorm.Expr("excluded.grupa_id"),
+					"jm_id":               gorm.Expr("excluded.jm_id"),
+					"cena_detal":          gorm.Expr("excluded.cena_detal"),
+					"cena_hurtowa":        gorm.Expr("excluded.cena_hurtowa"),
+					"cena_nocna":          gorm.Expr("excluded.cena_nocna"),
+					"cena_dodatkowa":      gorm.Expr("excluded.cena_dodatkowa"),
+					"cena_det_przed_prom": gorm.Expr("excluded.cena_det_przed_prom"),
+					"naj_cena30_det":      gorm.Expr("excluded.naj_cena30_det"),
+					"aktywny_wsi":         gorm.Expr("excluded.aktywny_wsi"),
+					"do_usuniecia":        gorm.Expr("excluded.do_usuniecia"),
+					"data_aktualizacji":   gorm.Expr("excluded.data_aktualizacji"),
+					"folder_zdjec":        gorm.Expr("excluded.folder_zdjec"),
+					"plik_zdjecia":        gorm.Expr("excluded.plik_zdjecia"),
+					"import_id":           gorm.Expr("excluded.import_id"),
+					"updated_at":          gorm.Expr("CURRENT_TIMESTAMP"),
+				}),
+			}).Create(&prodBatch).Error
+			if err != nil {
+				i.log.Error().Err(err).Int("n", len(prodBatch)).Msg("upsert st_products batch failed")
 				return err
 			}
 			insProducts += len(prodBatch)
 			prodBatch = prodBatch[:0]
 		}
+
+		// ---- stany ----
 		if len(stockBatch) > 0 {
-			if err := tx.Create(&stockBatch).Error; err != nil {
-				i.log.Error().Err(err).Int("n", len(stockBatch)).Msg("insert st_stock batch failed")
+			err := tx.Clauses(clause.OnConflict{
+				Columns: []clause.Column{{Name: "towar_id"}, {Name: "magazyn_id"}},
+				DoUpdates: clause.Assignments(map[string]interface{}{
+					"stan":       gorm.Expr("excluded.stan"),
+					"rezerwacja": gorm.Expr("excluded.rezerwacja"),
+					"import_id":  gorm.Expr("excluded.import_id"),
+					"updated_at": gorm.Expr("CURRENT_TIMESTAMP"),
+				}),
+			}).Create(&stockBatch).Error
+			if err != nil {
+				i.log.Error().Err(err).Int("n", len(stockBatch)).Msg("upsert st_stock batch failed")
 				return err
 			}
 			insStocks += len(stockBatch)
 			stockBatch = stockBatch[:0]
 		}
 		return nil
-	}
-
-	tx := i.db.Begin()
-	defer tx.Rollback()
-
-	// wyczyść staging dla tego importu (idempotentnie)
-	if err := tx.Where("import_id = ?", importID).Delete(&db.StStock{}).Error; err != nil {
-		return err
-	}
-	if err := tx.Where("import_id = ?", importID).Delete(&db.StProduct{}).Error; err != nil {
-		return err
 	}
 
 	for {
@@ -305,7 +333,7 @@ func (i *Importer) processFile(importID uint, fullPath string) error {
 
 		switch se := tok.(type) {
 		case xml.StartElement:
-			// 1) tylko <transmisja_id> – nie połykać całego <dane>
+			// transmisja_id
 			if strings.EqualFold(se.Name.Local, "transmisja_id") {
 				var tid string
 				if err := dec.DecodeElement(&tid, &se); err != nil {
@@ -320,7 +348,7 @@ func (i *Importer) processFile(importID uint, fullPath string) error {
 				continue
 			}
 
-			// 2) <towary> – zdekoduj całą listę <towar>
+			// towary
 			if strings.EqualFold(se.Name.Local, "towary") {
 				var tw struct {
 					Items []xmlTowar `xml:"towar"`
@@ -330,7 +358,6 @@ func (i *Importer) processFile(importID uint, fullPath string) error {
 				}
 
 				for _, t := range tw.Items {
-					// produkt → st_products (batch)
 					prodBatch = append(prodBatch, db.StProduct{
 						ImportID:         importID,
 						TowarID:          t.TowarID,
@@ -354,7 +381,6 @@ func (i *Importer) processFile(importID uint, fullPath string) error {
 						PlikZdjecia:      t.PlikZdjecia,
 					})
 
-					// stany → st_stock (batch)
 					for _, m := range t.Magazyny {
 						stockBatch = append(stockBatch, db.StStock{
 							ImportID:   importID,
@@ -365,24 +391,20 @@ func (i *Importer) processFile(importID uint, fullPath string) error {
 						})
 					}
 
-					// okresowy flush
 					if len(prodBatch) >= batchSize || len(stockBatch) >= batchSize {
 						if err := flushBatches(tx); err != nil {
 							return err
 						}
 					}
 				}
-				continue
 			}
-
-			// inne sekcje na razie pomijamy
 		}
 	}
 
-	// flush resztek i commit
 	if err := flushBatches(tx); err != nil {
 		return err
 	}
+
 	if err := tx.Commit().Error; err != nil {
 		i.log.Error().Err(err).Msg("tx commit failed")
 		return err
@@ -390,9 +412,10 @@ func (i *Importer) processFile(importID uint, fullPath string) error {
 
 	i.log.Info().
 		Uint("import_id", importID).
-		Int("products_inserted", insProducts).
-		Int("stocks_inserted", insStocks).
-		Msg("XML parsed → staging OK")
+		Int("products_upserted", insProducts).
+		Int("stocks_upserted", insStocks).
+		Msg("XML parsed → staging upsert OK")
+
 	return nil
 }
 
