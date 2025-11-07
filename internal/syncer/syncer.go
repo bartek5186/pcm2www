@@ -15,22 +15,22 @@ import (
 	"gorm.io/gorm"
 )
 
+// wrapper na uruchomioną integrację (np. importer i woocommerce)
 type runningInt struct {
 	Name string
 	Inst integrations.Integration
 }
 
 type Syncer struct {
-	log     zerolog.Logger
-	db      *gorm.DB
-	mu      sync.Mutex
-	cfg     *conf.Config
-	running bool
+	log     zerolog.Logger // logowanie
+	db      *gorm.DB       // dostęp do bazy
+	mu      sync.Mutex     // ochrona sekcji krytycznych
+	cfg     *conf.Config   // aktualna konfiguracja
+	running bool           // czy syncer działa
 	cancel  context.CancelFunc
-	wg      sync.WaitGroup
-	ticks   uint64
-
-	ints []runningInt
+	wg      sync.WaitGroup // śledzi goroutines
+	ticks   uint64         // licznik heartbeatów
+	ints    []runningInt   // lista aktywnych integracji
 }
 
 func New(log zerolog.Logger, cfg *conf.Config, gdb *gorm.DB) *Syncer {
@@ -183,13 +183,14 @@ func (s *Syncer) tickOnce() {
 	s.mu.Unlock()
 
 	// symulacja „pracy”
+	// globalne taski lub health-checki integracji.
 	s.log.Info().Msgf("Syncer(dev): heartbeat #%d (nic nie robię, tylko test)", n)
 	time.Sleep(100 * time.Millisecond)
 }
 
 // pomocniczo: wyciągnij aktualny interwał z tickera (best-effort)
 func tickerInterval(t *time.Ticker) time.Duration {
-	// Go nie udostępnia tego oficjalnie – trzymamy localnie w pętli przez interval()
+	// Go nie udostępnia tego oficjalnie – trzymamy lokalnie w pętli przez interval()
 	// Tu zwracamy „bezpiecznik”, by zawsze umożliwić Reset na nową wartość.
 	// W praktyce i tak porównamy z interval() i nadpiszemy.
 	return 0

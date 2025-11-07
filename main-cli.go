@@ -17,6 +17,7 @@ import (
 	"github.com/bartek5186/pcm2www/internal/db"
 	logs "github.com/bartek5186/pcm2www/internal/logs"
 	syncer "github.com/bartek5186/pcm2www/internal/syncer"
+	"gorm.io/gorm"
 )
 
 var ver = "1.0.0"
@@ -63,7 +64,7 @@ func main() {
 
 	// Prosta pętla poleceń w terminalu
 	fmt.Println("PCM2WWW CLI", ver)
-	fmt.Println("Komendy: start | stop | reload | status | paths | quit")
+	fmt.Println("Komendy: start | stop | reload | status | paths | resetdb! | quit")
 	reader := bufio.NewReader(os.Stdin)
 
 	for {
@@ -111,10 +112,27 @@ func main() {
 			s.Stop()
 			time.Sleep(50 * time.Millisecond)
 			return
+		case "resetdb":
+			fmt.Print("Na pewno chcesz wyczyścić bazę? (tak/nie): ")
+			confirm, _ := reader.ReadString('\n')
+			confirm = strings.TrimSpace(strings.ToLower(confirm))
+			if confirm != "tak" {
+				fmt.Println("Anulowano.")
+				continue
+			}
+
+			log.Warn().Msg("Czyszczenie bazy...")
+			if err := resetDB(dbh.DB); err != nil {
+				log.Error().Err(err).Msg("Błąd czyszczenia bazy")
+				fmt.Println("Błąd:", err)
+				continue
+			}
+			fmt.Println("Baza wyczyszczona.")
+			return
 		case "":
 			// enter – ignoruj
 		default:
-			fmt.Println("Nieznana komenda. Użyj: start | stop | reload | status | paths | quit")
+			fmt.Println("Nieznana komenda. Użyj: start | stop | reload | status | paths | resetdb! | quit")
 		}
 	}
 }
@@ -127,4 +145,25 @@ func mustAppDataDir(name string) string {
 	p := filepath.Join(base, name)
 	_ = os.MkdirAll(p, 0o755)
 	return p
+}
+
+// resetDB usuwa wszystkie dane z głównych tabel testowych.
+func resetDB(gdb *gorm.DB) error {
+	tables := []string{
+		"import_files",
+		"st_products",
+		"st_stocks",
+		"woo_product_caches",
+		"woo_tasks",
+		"link_issues",
+		"kvs",
+		"sqlite_sequence",
+	}
+
+	for _, t := range tables {
+		if err := gdb.Exec(fmt.Sprintf("DELETE FROM %s;", t)).Error; err != nil {
+			return fmt.Errorf("błąd czyszczenia tabeli %s: %w", t, err)
+		}
+	}
+	return nil
 }

@@ -91,6 +91,15 @@ func (i *Importer) Start(ctx context.Context) error {
 	}
 	i.db = gdb
 
+	// DEV: powtórny relink po 15 sekundach od startu, żeby Woo cache już był
+	go func() {
+		time.Sleep(15 * time.Second)
+		if err := i.LinkProductsByEAN(); err != nil {
+			i.log.Error().Err(err).Msg("LinkProductsByEAN retry failed")
+		}
+
+	}()
+
 	dir := expandHome(i.cfg.WatchDir)
 	ticker := time.NewTicker(i.interval())
 	defer ticker.Stop()
@@ -130,6 +139,8 @@ func (i *Importer) scanOnce(dir string) {
 		return
 	}
 
+	processed := false
+
 	for _, e := range entries {
 		if e.IsDir() {
 			continue
@@ -156,7 +167,7 @@ func (i *Importer) scanOnce(dir string) {
 						Int("status", rec.Status).Msg("plik istnieje, ale nie DONE — ponawiam przetwarzanie")
 					// leć dalej do processFile
 				} else {
-					i.log.Debug().Str("file", name).Msg("plik już był i DONE — pomijam")
+					//i.log.Debug().Str("file", name).Msg("plik już był i DONE — pomijam")
 					continue
 				}
 			} else {
@@ -172,20 +183,19 @@ func (i *Importer) scanOnce(dir string) {
 				Updates(map[string]any{"status": 2, "last_error": err.Error()})
 			continue
 		}
-
-		if err := i.LinkProductsByEAN(importID); err != nil {
-			i.log.Error().Err(err).Uint("import_id", importID).Msg("linking failed")
-			// nadal możesz ustawić status=1 na ImportFile, ale warto zostawić warning
-		}
-
-		// sukces: status=1, processed_at=now
+		// sukces
 		now := time.Now()
 		_ = i.db.Model(&db.ImportFile{}).Where("import_id = ?", importID).
 			Updates(map[string]any{"status": 1, "processed_at": now})
 
-		// DEV: usuwanie zakomentowane
-		// _ = os.Remove(full)
 		i.log.Info().Str("file", name).Uint("import_id", importID).Msg("przetworzono OK")
+		processed = true
+	}
+
+	if processed {
+		if err := i.LinkProductsByEAN(); err != nil {
+			i.log.Error().Err(err).Msg("LinkProductsByEAN failed after import")
+		}
 	}
 
 }

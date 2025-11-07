@@ -1,7 +1,9 @@
 // internal/db/models.go
 package db
 
-import "time"
+import (
+	"time"
+)
 
 // import_files
 type ImportFile struct {
@@ -79,15 +81,16 @@ type WooTask struct {
 	CreatedAt   time.Time `gorm:"autoCreateTime"`
 }
 
-// internal/db/models.go
 type LinkIssue struct {
-	ID        uint      `gorm:"primaryKey"`
-	ImportID  uint      `gorm:"index"`
-	TowarID   int64     `gorm:"index"`
-	Kod       string    `gorm:"index"` // potencjalnie EAN/SKU ze stagingu
-	Reason    string    `gorm:"index"` // missing_ean_src, missing_ean_shop, duplicate_ean_shop, duplicate_candidate, ambiguous
-	Details   string    `gorm:"type:text"`
-	CreatedAt time.Time `gorm:"autoCreateTime"`
+	ID        uint `gorm:"primaryKey"`
+	CreatedAt time.Time
+	UpdatedAt time.Time
+
+	TowarID int64  `gorm:"uniqueIndex:uniq_issue_key"`
+	Reason  string `gorm:"uniqueIndex:uniq_issue_key"`
+	Kod     string `gorm:"uniqueIndex:uniq_issue_key"`
+	WooIDs  string `gorm:"type:text"`
+	Details string `gorm:"type:text"`
 }
 
 // internal/db/models.go
