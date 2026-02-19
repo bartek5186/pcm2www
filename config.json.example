@@ -1,4 +1,9 @@
 {
+  "database": {
+    "driver": "sqlite",
+    "path": "~/.config/pcm2www/pcm2www.db",
+    "dsn": ""
+  },
   "integrations": {
     "woocommerce": {
       "base_url": "https://…",

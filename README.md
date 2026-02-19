@@ -3,14 +3,16 @@
 Ten plik konfiguracyjny opisuje integrację systemu **PC-Market 7 (PCM)** poprzez narzędzie **pcm2www** z platformą **WooCommerce**.  
 Integrator działa cyklicznie, pobiera dane z katalogu eksportów PC-Market (`exp_*`) oraz synchronizuje je z WooCommerce przy użyciu REST API.
 
+> **Status implementacji (2026-02-19):** funkcje oznaczone jako **[NIEGOTOWE]** lub **[CZĘŚCIOWO GOTOWE]** nie są jeszcze ukończone.
+
 ## Funkcjonalności
 
-- 🚀 **Automatyczna synchronizacja** produktów i stanów magazynowych  
+- 🚀 **Automatyczna synchronizacja** produktów i stanów magazynowych **[NIEGOTOWE: brak aktywnego workera wysyłki do WooCommerce]**  
 - 🔄 **Obsługa cache** – pełne i częściowe odświeżanie danych z WooCommerce  
-- 🗂️ **Import plików PCM** (`exp_wyk`, `exp_dok`, itp.) z katalogu wymiany  
-- 🛒 **Integracja przez REST API** WooCommerce (create, update, stock update)  
+- 🗂️ **Import plików PCM** (`exp_wyk`, `exp_dok`, itp.) z katalogu wymiany **[CZĘŚCIOWO GOTOWE: obecnie przetwarzane są głównie pliki `exp_wyk_*.xml`]**  
+- 🛒 **Integracja przez REST API** WooCommerce (create, update, stock update) **[NIEGOTOWE: create/update/stock update nie są jeszcze uruchomione]**  
 - ⚙️ **Elastyczna konfiguracja** poprzez plik JSON
-- 📡 **Ciągła praca w tle** – monitoring katalogu i cykliczne taski
+- 📡 **Ciągła praca w tle** – monitoring katalogu i cykliczne taski **[CZĘŚCIOWO GOTOWE: monitoring działa, taski wysyłki do Woo nie są jeszcze aktywne]**
 
 ---
 Integrator posiada narzędzie CLI, tak samo jak narzędzie Desktopowe (Windows)
@@ -23,6 +25,11 @@ Plik konfiguracyjny wrzucamy w ~/.config/pcm2www/config.json
 
 ```json
 {
+  "database": {
+    "driver": "sqlite",
+    "path": "~/.config/pcm2www/pcm2www.db",
+    "dsn": ""
+  },
   "integrations": {
     "woocommerce": {
       "base_url": "https://new...",
@@ -31,7 +38,7 @@ Plik konfiguracyjny wrzucamy w ~/.config/pcm2www/config.json
       "poll_sec": 10,
       "cache": {
         "prime_on_start": true,
-        "sweep_interval_minutes": 360
+        "sweep_interval_minutes": 360,
         "fields": "id,sku,name,regular_price,sale_price,stock_quantity,manage_stock,status,hurt_price,ean,date_modified_gmt,type"
       }
     },
@@ -47,14 +54,45 @@ Plik konfiguracyjny wrzucamy w ~/.config/pcm2www/config.json
 
 Integracja składa się z trzech głównych sekcji:
 
+- **database** – wybór silnika bazy danych (`sqlite` / `postgres` / `mysql`)
 - **integrations.woocommerce** – ustawienia połączenia z WooCommerce
 - **integrations.importer** – ustawienia importu plików z PC-Market
 - **auto_start, sync_interval_seconds** – parametry globalne
 
+## Baza danych
+
+Sekcja `database` pozwala przełączać backend danych:
+
+- `driver: "sqlite"` – lokalny plik bazy (`path`), domyślny tryb.
+- `driver: "postgres"` – połączenie po `dsn`.
+- `driver: "mysql"` – połączenie po `dsn`.
+
+Przykłady:
+
+```json
+{
+  "database": {
+    "driver": "postgres",
+    "dsn": "host=127.0.0.1 user=pcm password=pcm dbname=pcm2www port=5432 sslmode=disable TimeZone=UTC"
+  }
+}
+```
+
+```json
+{
+  "database": {
+    "driver": "mysql",
+    "dsn": "pcm:pcm@tcp(127.0.0.1:3306)/pcm2www?parseTime=true&loc=UTC"
+  }
+}
+```
+
+> Zmiana `database.*` wymaga restartu aplikacji (reload configu nie przełącza aktywnego połączenia DB w locie).
+
 ## Parametry globalne
 
 - **auto_start** – integrator startuje automatycznie po uruchomieniu aplikacji.  
-- **sync_interval_seconds** – co ile sekund przetwarzane są zadania synchronizacji w kolejce (np. wysyłka zmian do WooCommerce).  
+- **sync_interval_seconds** – globalny interwał pętli syncera (heartbeat). **[CZĘŚCIOWO GOTOWE: docelowe przetwarzanie kolejki wysyłek do WooCommerce nie jest jeszcze aktywne]**  
   → W tym przypadku co **10 sekund**.
 
 ---
@@ -65,7 +103,7 @@ Integracja składa się z trzech głównych sekcji:
 
 - **base_url** – adres sklepu WooCommerce (REST API).  
 - **consumer_key** i **consumer_secret** – klucze API wygenerowane w WooCommerce (używane do autoryzacji).  
-- **poll_sec** – częstotliwość sprawdzania kolejki zadań dla WooCommerce, tutaj co **10 sekund**.
+- **poll_sec** – interwał pętli integracji WooCommerce (aktualnie logowanie/ping), tutaj co **10 sekund**. **[NIEGOTOWE: kolejka `woo_tasks` nie jest jeszcze aktywnie przetwarzana]**
 
 ### Konfiguracja cache
 
@@ -89,7 +127,7 @@ Sekcja `cache` określa sposób buforowania danych produktów z WooCommerce:
 
 Sekcja `importer` odpowiada za pobieranie danych z PC-Market:
 
-- **watch_dir** – katalog, w którym PCM umieszcza eksporty (np. exp_wyk_*.xml, exp_dok_*.xml).  
+- **watch_dir** – katalog, w którym PCM umieszcza eksporty (np. exp_wyk_*.xml, exp_dok_*.xml). **[CZĘŚCIOWO GOTOWE: obecnie implementacja koncentruje się na `exp_wyk_*.xml`]**  
   W tej konfiguracji: `~/pcm2www/imports`.  
 - **poll_sec** – co ile sekund sprawdzany jest katalog importu, tutaj co **5 sekund**.
 
@@ -100,22 +138,19 @@ Sekcja `importer` odpowiada za pobieranie danych z PC-Market:
 1. **PC-Market 7** generuje pliki eksportu (exp_wyk, exp_dok, itd.) do katalogu `~/pcm2www/imports`.  
 2. **Importer** monitoruje katalog i wczytuje nowe pliki XML (co 5 sekund).  
 3. Dane są zapisywane do lokalnej bazy/cache integratora.  
-4. **WooCommerce worker** co 10 sekund sprawdza różnice i wysyła zmiany do WooCommerce REST API.  
+4. **WooCommerce worker** co 10 sekund sprawdza różnice i wysyła zmiany do WooCommerce REST API. **[NIEGOTOWE: worker nie jest obecnie uruchomiony]**  
 5. **Cache WooCommerce** jest odświeżany:
-   - pełny stan co 6h,  
-   - stany magazynowe co 2h,  
-   - dodatkowo pełna synchronizacja przy starcie (`prime_on_start=true`).  
+   - pełny/paginowany odczyt produktów przy starcie (`prime_on_start=true`),  
+   - odświeżanie przyrostowe co `sweep_interval_minutes`,  
+   - osobny harmonogram stanów magazynowych co 2h **[NIEGOTOWE]**.  
 
 ---
 
 ## Podsumowanie
 
-- Integrator działa w trybie **ciągłej synchronizacji**.  
-- Zmiany w PCM (towary, stany, ceny) są widoczne w WooCommerce niemal w czasie rzeczywistym.  
-- Harmonogram zapewnia równowagę pomiędzy **aktualnością danych** a **wydajnością**:
-  - pliki z PCM → WooCommerce: co 5s  
-  - zadania do WooCommerce: co 10s  
-  - cache pełny: co 6h  
-  - cache stanów: co 2h  
-
-Dzięki temu integracja jest szybka, a jednocześnie minimalizuje obciążenie WooCommerce.
+- Integrator działa w trybie **ciągłej pracy** (monitoring importu + cache Woo).  
+- Synchronizacja zmian PCM → WooCommerce jest **[NIEGOTOWA]** (brak aktywnego workera wysyłki).  
+- Aktualny harmonogram:
+  - import plików z katalogu wymiany: wg `importer.poll_sec` (np. 5s),  
+  - pętla integracji Woo: wg `woocommerce.poll_sec` (np. 10s, obecnie tryb dev/ping),  
+  - odświeżanie cache Woo: wg `cache.sweep_interval_minutes` (np. 360 min).

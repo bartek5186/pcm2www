@@ -26,19 +26,6 @@ func main() {
 	appDir := mustAppDataDir("pcm2www")
 	log := logs.New(filepath.Join(appDir, "app.log"), true)
 
-	dbh, err := db.OpenAt(appDir)
-	if err != nil {
-		log.Fatal().Err(err).Msg("DB open error")
-	}
-	if err := dbh.Migrate(); err != nil {
-		log.Fatal().Err(err).Msg("DB migrate error")
-	}
-	log.Info().Str("db", dbh.Path).Msg("DB ready")
-	sqlDB, _ := dbh.DB.DB()
-	defer sqlDB.Close()
-
-	log.Info().Msg("Aplikacja (CLI) uruchomiona")
-
 	cfgPath := filepath.Join(appDir, "config.json")
 	cfg, firstRun, err := conf.LoadOrCreate(cfgPath)
 	if err != nil {
@@ -47,6 +34,23 @@ func main() {
 	if firstRun {
 		log.Info().Msgf("Utworzono domyślną konfigurację: %s", cfgPath)
 	}
+
+	dbh, err := db.OpenWithConfig(appDir, db.OpenConfig{
+		Driver: cfg.Database.Driver,
+		DSN:    cfg.Database.DSN,
+		Path:   cfg.Database.Path,
+	})
+	if err != nil {
+		log.Fatal().Err(err).Msg("DB open error")
+	}
+	if err := dbh.Migrate(); err != nil {
+		log.Fatal().Err(err).Msg("DB migrate error")
+	}
+	log.Info().Str("driver", dbh.Driver).Str("db", dbh.Path).Msg("DB ready")
+	sqlDB, _ := dbh.DB.DB()
+	defer sqlDB.Close()
+
+	log.Info().Msg("Aplikacja (CLI) uruchomiona")
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
@@ -157,7 +161,6 @@ func resetDB(gdb *gorm.DB) error {
 		"woo_tasks",
 		"link_issues",
 		"kvs",
-		"sqlite_sequence",
 	}
 
 	for _, t := range tables {
@@ -165,5 +168,7 @@ func resetDB(gdb *gorm.DB) error {
 			return fmt.Errorf("błąd czyszczenia tabeli %s: %w", t, err)
 		}
 	}
+	// reset autoinkrementacji w SQLite (ignoruj błąd dla innych silników DB)
+	_ = gdb.Exec("DELETE FROM sqlite_sequence;").Error
 	return nil
 }

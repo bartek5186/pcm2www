@@ -30,19 +30,6 @@ func main() {
 	appDir := mustAppDataDir("pcm2www")
 	log := logs.New(filepath.Join(appDir, "app.log"), false)
 
-	dbh, err := db.OpenAt(appDir)
-	if err != nil {
-		log.Fatal().Err(err).Msg("DB open error")
-	}
-	if err := dbh.Migrate(); err != nil {
-		log.Fatal().Err(err).Msg("DB migrate error")
-	}
-	log.Info().Str("db", dbh.Path).Msg("DB ready")
-
-	log.Info().Msg("Aplikacja uruchomiona")
-	sqlDB, _ := dbh.DB.DB()
-	defer sqlDB.Close()
-
 	cfgPath := filepath.Join(appDir, "config.json")
 	cfg, firstRun, err := conf.LoadOrCreate(cfgPath)
 	if err != nil {
@@ -51,6 +38,23 @@ func main() {
 	if firstRun {
 		log.Info().Msgf("Utworzono domyślną konfigurację: %s", cfgPath)
 	}
+
+	dbh, err := db.OpenWithConfig(appDir, db.OpenConfig{
+		Driver: cfg.Database.Driver,
+		DSN:    cfg.Database.DSN,
+		Path:   cfg.Database.Path,
+	})
+	if err != nil {
+		log.Fatal().Err(err).Msg("DB open error")
+	}
+	if err := dbh.Migrate(); err != nil {
+		log.Fatal().Err(err).Msg("DB migrate error")
+	}
+	log.Info().Str("driver", dbh.Driver).Str("db", dbh.Path).Msg("DB ready")
+
+	log.Info().Msg("Aplikacja uruchomiona")
+	sqlDB, _ := dbh.DB.DB()
+	defer sqlDB.Close()
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()

@@ -4,7 +4,11 @@ go 1.24.0
 
 toolchain go1.24.7
 
-require github.com/getlantern/systray v1.2.1
+require (
+	github.com/getlantern/systray v1.2.1
+	gorm.io/driver/mysql v1.6.0
+	gorm.io/driver/postgres v1.6.0
+)
 
 require (
 	github.com/getlantern/context v0.0.0-20190109183933-c447772a6520 // indirect

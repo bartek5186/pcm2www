@@ -6,12 +6,23 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/bartek5186/pcm2www/internal/integrations/woocommerce"
 )
 
+type DBConfig struct {
+	// Driver: sqlite | postgres | mysql
+	Driver string `json:"driver"`
+	// DSN używany dla postgres/mysql
+	DSN string `json:"dsn,omitempty"`
+	// Path używany dla sqlite (opcjonalny; domyślnie ~/.config/pcm2www/pcm2www.db)
+	Path string `json:"path,omitempty"`
+}
+
 // Główny config aplikacji
 type Config struct {
+	Database            DBConfig                   `json:"database"`
 	AutoStart           bool                       `json:"auto_start"`
 	SyncIntervalSeconds int                        `json:"sync_interval_seconds"`
 	Integrations        map[string]json.RawMessage `json:"integrations"` // nazwa -> surowy JSON integracji
@@ -50,6 +61,9 @@ func LoadOrCreate(path string) (*Config, bool, error) {
 			rawWoo, _ := json.Marshal(woo)
 
 			cfg := &Config{
+				Database: DBConfig{
+					Driver: "sqlite",
+				},
 				AutoStart:           false,
 				SyncIntervalSeconds: 5,
 				Integrations: map[string]json.RawMessage{
@@ -72,6 +86,9 @@ func LoadOrCreate(path string) (*Config, bool, error) {
 	}
 	if cfg.Integrations == nil {
 		cfg.Integrations = map[string]json.RawMessage{}
+	}
+	if strings.TrimSpace(cfg.Database.Driver) == "" {
+		cfg.Database.Driver = "sqlite"
 	}
 	return &cfg, false, nil
 }
