@@ -146,8 +146,12 @@ Worker działa w tle i przetwarza kolejkę zadań atomicznie (claim → execute 
 | Kind | Opis | Polityki skip |
 |---|---|---|
 | `ean.update` | Ustawienie EAN produktu w Woo | Skip jeśli produkt już ma jakikolwiek EAN; skip jeśli EAN zajęty przez inny produkt |
-| `stock.update` | Aktualizacja stanu magazynowego | Skip jeśli `manage_stock=false`; skip jeśli stan już się zgadza |
+| `stock.update` | Aktualizacja stanu magazynowego | Skip jeśli `manage_stock=false`; skip jeśli stan już się zgadza; skip jeśli PCM nie zmienił stanu od poprzedniego importu (ochrona przed nadpisaniem sprzedaży) |
 | `price.update` | Aktualizacja ceny regularnej i hurtowej | Skip jeśli aktywna `sale_price > 0`; skip jeśli cena już się zgadza |
+
+#### Ochrona przed nadpisaniem sprzedaży online
+
+`st_stocks` przechowuje kolumnę `stan_prev` — poprzednią wartość stanu PCM przed ostatnim upsertem (NULL przy pierwszym imporcie produktu). Planner porównuje `stan` z `stan_prev`: jeśli są równe, PCM nie zmienił stanu od ostatniego eksportu, więc różnica w cache Woo prawdopodobnie wynika ze sprzedaży w sklepie — task `stock.update` nie jest generowany. Jeśli PCM zmienił stan (np. pracownik zrobił korektę lub przyjął dostawę), delta ≠ 0 i task jest generowany z wartością absolutną z PCM.
 
 Każdy task jest weryfikowany po aktualizacji (GET po PUT). Nieudane taski są requeue'owane.
 **Tworzenie nowych produktów w Woo jest [NIEGOTOWE].**
@@ -182,7 +186,7 @@ PC-Market 7
            ↓
     [Planner] – porównanie staging vs cache, generowanie woo_tasks
     ├─ ean.update (jeśli EAN produktu niezgodny lub brak w Woo)
-    ├─ stock.update (jeśli stan magazynowy się różni)
+    ├─ stock.update (jeśli stan się różni AND PCM zmienił stan od ostatniego importu)
     └─ price.update (jeśli cena różni się i brak aktywnej promocji)
            ↓
     [Worker] – claim → fetch → verify → PUT → verify → sync cache

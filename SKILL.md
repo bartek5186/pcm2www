@@ -33,7 +33,7 @@ Implemented and active:
 - task planner (`planner.go`): compares staging vs cache, generates `woo_tasks` for EAN/stock/price updates
 - task worker (`worker.go`): atomically claims tasks, executes via WooCommerce REST API, verifies, syncs cache
   - `ean.update`: sets EAN on product (skips if product already has any EAN, or EAN taken)
-  - `stock.update`: updates stock quantity (skips if manage_stock=false, or already matches)
+  - `stock.update`: updates stock quantity (skips if manage_stock=false, already matches, or PCM stock unchanged since last import — see prev_stock guard below)
   - `price.update`: updates regular_price + hurt_price (skips if sale_price active, or already matches)
 - retry/requeue logic on worker failure
 - CLI mode on non-Windows, systray app on Windows
@@ -140,6 +140,7 @@ When changing planner behavior:
 - planner is idempotent: pending/running tasks are skipped; done/error tasks are requeued
 - planner only operates on linked products (towar_id filled); unlinked = skip
 - planner only operates on unambiguous 1:1 matches; >1 woo entry per towar_id = skip
+- **prev_stock guard**: `st_stocks.stan_prev` stores the previous PCM stock value (NULL on first import). If `stan == stan_prev` (PCM didn't change since last export), the planner skips `stock.update` even if the Woo cache shows a different value. This prevents overwriting stock reductions caused by online sales. If PCM stock changed (e.g. delivery, inventory correction), the task is generated with an absolute set value from PCM.
 
 When changing worker behavior:
 
@@ -172,6 +173,7 @@ When changing DB schema:
 - Planner does NOT create new products in Woo — only updates to existing linked products.
 - Worker skips `ean.update` if the product in Woo already has ANY EAN (conservative policy).
 - Worker skips `price.update` if `sale_price > 0` (does not override active promotions).
+- `st_stocks.stan_prev` is NULL for the first import of each warehouse row; planner treats NULL as "no history" and uses absolute set. Only on the second and subsequent imports does the prev_stock guard activate.
 
 ## Preferred validation
 

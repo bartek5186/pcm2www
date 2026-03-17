@@ -220,6 +220,71 @@ func TestPlanWooTasksAppliesSafetyPolicy(t *testing.T) {
 	}
 }
 
+// TestPlanWooTasksSkipsStockWhenPCMUnchanged weryfikuje, że jeśli stan PCM się nie zmienił
+// (delta=0), planner nie generuje stock.update — nawet gdy cache Woo różni się (np. po sprzedaży).
+func TestPlanWooTasksSkipsStockWhenPCMUnchanged(t *testing.T) {
+	gdb := newImporterTestDB(t)
+	importer := &Importer{log: zerolog.Nop(), db: gdb}
+
+	const importID = 11
+	towarID := int64(300)
+	wooID := uint(400)
+	prevStan := float64(5)
+
+	if err := gdb.Create(&db.ImportFile{ImportID: importID, Filename: "exp_wyk_test_3.xml", Status: 1}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := gdb.Create(&db.StProduct{
+		ImportID:    importID,
+		TowarID:     towarID,
+		Kod:         "4006381333931",
+		Nazwa:       "Unchanged Stock Product",
+		CenaDetal:   10,
+		CenaHurtowa: 8,
+		AktywnyWSI:  true,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	// Stan=5, StanPrev=5 — PCM nie zmienił stanu od poprzedniego importu
+	if err := gdb.Create(&db.StStock{
+		ImportID:   importID,
+		TowarID:    towarID,
+		MagazynID:  1,
+		Stan:       5,
+		StanPrev:   &prevStan,
+		Rezerwacja: 0,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	// Cache Woo pokazuje 4 — bo sklep sprzedał 1 sztukę
+	if err := gdb.Create(&db.WooProductCache{
+		WooID:        wooID,
+		TowarID:      &towarID,
+		Kod:          "SKU-3",
+		Ean:          "4006381333931",
+		Name:         "Unchanged Stock Product",
+		PriceRegular: 10,
+		PriceSale:    0,
+		HurtPrice:    8,
+		StockQty:     4,
+		StockManaged: true,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	if err := importer.PlanWooTasks(importID); err != nil {
+		t.Fatal(err)
+	}
+
+	var stockTasks []db.WooTask
+	if err := gdb.Where("kind = ?", db.WooTaskKindStockUpdate).Find(&stockTasks).Error; err != nil {
+		t.Fatal(err)
+	}
+	if len(stockTasks) != 0 {
+		t.Fatalf("expected 0 stock tasks (PCM unchanged), got %d", len(stockTasks))
+	}
+}
+
 func newImporterTestDB(t *testing.T) *gorm.DB {
 	t.Helper()
 

@@ -15,16 +15,17 @@ import (
 )
 
 type plannerSourceRow struct {
-	ImportID      uint
-	TowarID       int64
-	Kod           string
-	Nazwa         string
-	CenaDetal     float64
-	CenaHurtowa   float64
-	AktywnyWSI    bool
-	DoUsuniecia   bool
-	TotalStock    float64
-	TotalReserved float64
+	ImportID       uint
+	TowarID        int64
+	Kod            string
+	Nazwa          string
+	CenaDetal      float64
+	CenaHurtowa    float64
+	AktywnyWSI     bool
+	DoUsuniecia    bool
+	TotalStock     float64
+	TotalReserved  float64
+	TotalStockPrev *float64 // NULL jeśli brak historii dla choć jednego magazynu
 }
 
 type plannerCacheRow struct {
@@ -279,7 +280,8 @@ SELECT
 	p.aktywny_wsi,
 	p.do_usuniecia,
 	COALESCE(SUM(s.stan), 0) AS total_stock,
-	COALESCE(SUM(s.rezerwacja), 0) AS total_reserved
+	COALESCE(SUM(s.rezerwacja), 0) AS total_reserved,
+	CASE WHEN COUNT(*) = COUNT(s.stan_prev) THEN SUM(s.stan_prev) ELSE NULL END AS total_stock_prev
 FROM st_products p
 LEFT JOIN st_stocks s ON s.towar_id = p.towar_id
 WHERE p.import_id = ?
@@ -390,6 +392,22 @@ func (i *Importer) planStockUpdateTask(tx *gorm.DB, importID uint, src plannerSo
 	desiredStock := math.Max(src.TotalStock-src.TotalReserved, 0)
 	if floatAlmostEqual(cache.StockQty, desiredStock) {
 		return false, false, false, false, nil
+	}
+	// Jeśli mamy historię PCM i efektywny stan się nie zmienił, nie nadpisuj Woo —
+	// różnica w cache może wynikać ze sprzedaży w sklepie (której PCM jeszcze nie zna).
+	if src.TotalStockPrev != nil {
+		prevNet := math.Max(*src.TotalStockPrev-src.TotalReserved, 0)
+		if floatAlmostEqual(desiredStock, prevNet) {
+			i.log.Debug().
+				Uint("import_id", importID).
+				Uint("woo_id", cache.WooID).
+				Int64("towar_id", src.TowarID).
+				Float64("pcm_stock", src.TotalStock).
+				Float64("pcm_stock_prev", *src.TotalStockPrev).
+				Float64("cache_stock", cache.StockQty).
+				Msg("task planner: skip stock update — PCM unchanged, cache diff likely from Woo sale")
+			return false, false, false, false, nil
+		}
 	}
 	if !cache.StockManaged {
 		i.log.Debug().

@@ -51,6 +51,7 @@ type StStock struct {
 	TowarID    int64 `gorm:"uniqueIndex:uniq_towar_mag"`
 	MagazynID  int64 `gorm:"uniqueIndex:uniq_towar_mag"`
 	Stan       float64
+	StanPrev   *float64 // poprzednia wartość stan (NULL = brak historii, pierwszy import)
 	Rezerwacja float64
 	ImportID   uint `gorm:"index"`
 	UpdatedAt  time.Time

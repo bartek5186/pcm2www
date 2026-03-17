@@ -55,16 +55,18 @@ func (w *Woo) workerTick(ctx context.Context, gdb *gorm.DB) {
 }
 
 func claimNextWooTask(gdb *gorm.DB) (*db.WooTask, error) {
-	var task db.WooTask
+	var tasks []db.WooTask
 	if err := gdb.
 		Where("status = ?", "pending").
 		Order("created_at ASC, task_id ASC").
-		Take(&task).Error; err != nil {
-		if errors.Is(err, gorm.ErrRecordNotFound) {
-			return nil, nil
-		}
+		Limit(1).
+		Find(&tasks).Error; err != nil {
 		return nil, err
 	}
+	if len(tasks) == 0 {
+		return nil, nil
+	}
+	task := tasks[0]
 
 	now := time.Now()
 	res := gdb.Model(&db.WooTask{}).

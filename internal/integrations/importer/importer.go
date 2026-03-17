@@ -315,6 +315,7 @@ func (i *Importer) processFile(importID uint, fullPath string) error {
 			err := tx.Clauses(clause.OnConflict{
 				Columns: []clause.Column{{Name: "towar_id"}, {Name: "magazyn_id"}},
 				DoUpdates: clause.Assignments(map[string]interface{}{
+					"stan_prev":  gorm.Expr("stan"),
 					"stan":       gorm.Expr("excluded.stan"),
 					"rezerwacja": gorm.Expr("excluded.rezerwacja"),
 					"import_id":  gorm.Expr("excluded.import_id"),
