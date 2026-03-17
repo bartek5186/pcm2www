@@ -20,11 +20,12 @@ type WooCache struct {
 }
 
 type Config struct {
-	BaseURL     string   `json:"base_url"` // https://shop.example.com
-	ConsumerKey string   `json:"consumer_key"`
-	ConsumerSec string   `json:"consumer_secret"`
-	PollSec     int      `json:"poll_sec"` // co ile sekund sprawdzać (dev)
-	Cache       WooCache `json:"cache"`
+	BaseURL      string              `json:"base_url"` // https://shop.example.com
+	ConsumerKey  string              `json:"consumer_key"`
+	ConsumerSec  string              `json:"consumer_secret"`
+	PollSec      int                 `json:"poll_sec"` // co ile sekund sprawdzać (dev)
+	Cache        WooCache            `json:"cache"`
+	CustomFields []CustomFieldConfig `json:"custom_fields,omitempty"`
 }
 
 type Woo struct {
@@ -62,7 +63,7 @@ func (w *Woo) Start(ctx context.Context) error {
 	}
 
 	// 2) odpal worker zadań (jeśli już masz woo_tasks)
-	//go w.runWorker(w.ctx, gdb)
+	go w.runWorker(w.ctx, gdb)
 
 	// 3) dev ping/ticker (jak miałeś)
 	ticker := time.NewTicker(w.interval())

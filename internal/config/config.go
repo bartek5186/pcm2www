@@ -32,11 +32,12 @@ type Config struct {
 
 // Przykładowy config integracji WooCommerce (używany do domyślnego JSON-a)
 type WooDefaults struct {
-	BaseURL     string               `json:"base_url"`
-	ConsumerKey string               `json:"consumer_key"`
-	ConsumerSec string               `json:"consumer_secret"`
-	PollSec     int                  `json:"poll_sec"`
-	Cache       woocommerce.WooCache `json:"cache"`
+	BaseURL      string                          `json:"base_url"`
+	ConsumerKey  string                          `json:"consumer_key"`
+	ConsumerSec  string                          `json:"consumer_secret"`
+	PollSec      int                             `json:"poll_sec"`
+	Cache        woocommerce.WooCache            `json:"cache"`
+	CustomFields []woocommerce.CustomFieldConfig `json:"custom_fields,omitempty"`
 }
 
 func LoadOrCreate(path string) (*Config, bool, error) {
@@ -55,7 +56,16 @@ func LoadOrCreate(path string) (*Config, bool, error) {
 				Cache: woocommerce.WooCache{
 					PrimeOnStart:         true,
 					SweepIntervalMinutes: 360, //6h
-					Fields:               "id,sku,name,regular_price,sale_price,stock_quantity,manage_stock,status,date_modified_gmt",
+					Fields:               "id,sku,name,regular_price,sale_price,stock_quantity,manage_stock,status,date_modified_gmt,type,global_unique_id",
+				},
+				CustomFields: []woocommerce.CustomFieldConfig{
+					{
+						Code:          "hurt_price",
+						ReadTopLevel:  "hurt_price",
+						ReadMetaKey:   "_hurt_price",
+						WriteTopLevel: "hurt_price",
+						WriteMetaKey:  "_hurt_price",
+					},
 				},
 			}
 			rawWoo, _ := json.Marshal(woo)

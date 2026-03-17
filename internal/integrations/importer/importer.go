@@ -97,8 +97,11 @@ func (i *Importer) Start(ctx context.Context) error {
 		time.Sleep(15 * time.Second)
 		if err := i.LinkProductsByEAN(); err != nil {
 			i.log.Error().Err(err).Msg("LinkProductsByEAN retry failed")
+			return
 		}
-
+		if err := i.PlanWooTasksForRecentImports(24 * time.Hour); err != nil {
+			i.log.Error().Err(err).Msg("PlanWooTasksForRecentImports retry failed")
+		}
 	}()
 
 	dir := expandHome(i.cfg.WatchDir)
@@ -141,6 +144,7 @@ func (i *Importer) scanOnce(dir string) {
 	}
 
 	processed := false
+	processedImportIDs := make([]uint, 0, 4)
 
 	for _, e := range entries {
 		if e.IsDir() {
@@ -191,11 +195,16 @@ func (i *Importer) scanOnce(dir string) {
 
 		i.log.Info().Str("file", name).Uint("import_id", importID).Msg("przetworzono OK")
 		processed = true
+		processedImportIDs = append(processedImportIDs, importID)
 	}
 
 	if processed {
 		if err := i.LinkProductsByEAN(); err != nil {
 			i.log.Error().Err(err).Msg("LinkProductsByEAN failed after import")
+			return
+		}
+		if err := i.PlanWooTasksForImports(processedImportIDs); err != nil {
+			i.log.Error().Err(err).Msg("PlanWooTasksForImports failed after import")
 		}
 	}
 

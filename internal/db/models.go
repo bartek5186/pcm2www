@@ -76,13 +76,20 @@ type WooProductCache struct {
 // woo_tasks
 type WooTask struct {
 	TaskID      uint   `gorm:"primaryKey;column:task_id"`
+	TaskKey     string `gorm:"uniqueIndex"`
 	ImportID    uint   `gorm:"index"`
+	TowarID     *int64 `gorm:"index"`
+	WooID       *uint  `gorm:"index"`
 	Kind        string `gorm:"index"` // np. product.update, stock.update
 	PayloadJSON string `gorm:"type:text"`
 	DependsOn   *uint
-	Status      string    `gorm:"index;default:pending"` // pending/done/error
+	Status      string `gorm:"index;default:pending"` // pending/done/error
+	Attempts    int
+	StartedAt   *time.Time
+	FinishedAt  *time.Time
 	LastError   string    `gorm:"type:text"`
 	CreatedAt   time.Time `gorm:"autoCreateTime"`
+	UpdatedAt   time.Time `gorm:"autoUpdateTime"`
 }
 
 type LinkIssue struct {

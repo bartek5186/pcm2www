@@ -1,23 +1,23 @@
-# Konfiguracja integracji PCM2WWW z WooCommerce
+# Integracja PCM2WWW z WooCommerce
 
-Ten plik konfiguracyjny opisuje integrację systemu **PC-Market 7 (PCM)** poprzez narzędzie **pcm2www** z platformą **WooCommerce**.  
-Integrator działa cyklicznie, pobiera dane z katalogu eksportów PC-Market (`exp_*`) oraz synchronizuje je z WooCommerce przy użyciu REST API.
+Ten plik opisuje integrację systemu **PC-Market 7 (PCM)** poprzez narzędzie **pcm2www** z platformą **WooCommerce**.
+Integrator działa cyklicznie, pobiera dane z katalogu eksportów PC-Market (`exp_wyk_*.xml`) oraz synchronizuje je z WooCommerce przy użyciu REST API.
 
-> **Status implementacji (2026-02-19):** funkcje oznaczone jako **[NIEGOTOWE]** lub **[CZĘŚCIOWO GOTOWE]** nie są jeszcze ukończone.
+> **Status implementacji (2026-03-17):** funkcje oznaczone jako **[NIEGOTOWE]** nie są jeszcze ukończone.
 
 ## Funkcjonalności
 
-- 🚀 **Automatyczna synchronizacja** produktów i stanów magazynowych **[NIEGOTOWE: brak aktywnego workera wysyłki do WooCommerce]**  
-- 🔄 **Obsługa cache** – pełne i częściowe odświeżanie danych z WooCommerce  
-- 🗂️ **Import plików PCM** (`exp_wyk`, `exp_dok`, itp.) z katalogu wymiany **[CZĘŚCIOWO GOTOWE: obecnie przetwarzane są głównie pliki `exp_wyk_*.xml`]**  
-- 🛒 **Integracja przez REST API** WooCommerce (create, update, stock update) **[NIEGOTOWE: create/update/stock update nie są jeszcze uruchomione]**  
-- ⚙️ **Elastyczna konfiguracja** poprzez plik JSON
-- 📡 **Ciągła praca w tle** – monitoring katalogu i cykliczne taski **[CZĘŚCIOWO GOTOWE: monitoring działa, taski wysyłki do Woo nie są jeszcze aktywne]**
+- **Automatyczna synchronizacja** stanów magazynowych, EAN i cen do WooCommerce (aktywna)
+- **Obsługa cache** – pełne i przyrostowe odświeżanie danych z WooCommerce
+- **Import plików PCM** – aktualnie obsługiwany format: `exp_wyk_*.xml` **[inne typy: NIEGOTOWE]**
+- **Integracja przez REST API** WooCommerce: update stanu, EAN, ceny (aktywne); tworzenie nowych produktów **[NIEGOTOWE]**
+- **Elastyczna konfiguracja** poprzez plik JSON
+- **Ciągła praca w tle** – monitoring katalogu, kolejka tasków, worker wysyłki do Woo
 
 ---
-Integrator posiada narzędzie CLI, tak samo jak narzędzie Desktopowe (Windows)
-Plik konfiguracyjny wrzucamy w ~/.config/pcm2www/config.json
 
+Integrator posiada narzędzie CLI (Linux/Mac) oraz aplikację z systray (Windows).
+Plik konfiguracyjny: `~/.config/pcm2www/config.json`
 
 ---
 
@@ -39,8 +39,17 @@ Plik konfiguracyjny wrzucamy w ~/.config/pcm2www/config.json
       "cache": {
         "prime_on_start": true,
         "sweep_interval_minutes": 360,
-        "fields": "id,sku,name,regular_price,sale_price,stock_quantity,manage_stock,status,hurt_price,ean,date_modified_gmt,type"
-      }
+        "fields": "id,sku,name,regular_price,sale_price,stock_quantity,manage_stock,status,global_unique_id,date_modified_gmt,type"
+      },
+      "custom_fields": [
+        {
+          "code": "hurt_price",
+          "read_top_level": "hurt_price",
+          "read_meta_key": "_hurt_price",
+          "write_top_level": "hurt_price",
+          "write_meta_key": "_hurt_price"
+        }
+      ]
     },
     "importer": {
       "watch_dir": "~/pcm2www/imports",
@@ -91,9 +100,8 @@ Przykłady:
 
 ## Parametry globalne
 
-- **auto_start** – integrator startuje automatycznie po uruchomieniu aplikacji.  
-- **sync_interval_seconds** – globalny interwał pętli syncera (heartbeat). **[CZĘŚCIOWO GOTOWE: docelowe przetwarzanie kolejki wysyłek do WooCommerce nie jest jeszcze aktywne]**  
-  → W tym przypadku co **10 sekund**.
+- **auto_start** – integrator startuje automatycznie po uruchomieniu aplikacji.
+- **sync_interval_seconds** – globalny interwał heartbeat syncera, tutaj co **10 sekund**.
 
 ---
 
@@ -101,25 +109,48 @@ Przykłady:
 
 ### Połączenie z API
 
-- **base_url** – adres sklepu WooCommerce (REST API).  
-- **consumer_key** i **consumer_secret** – klucze API wygenerowane w WooCommerce (używane do autoryzacji).  
-- **poll_sec** – interwał pętli integracji WooCommerce (aktualnie logowanie/ping), tutaj co **10 sekund**. **[NIEGOTOWE: kolejka `woo_tasks` nie jest jeszcze aktywnie przetwarzana]**
+- **base_url** – adres sklepu WooCommerce (REST API).
+- **consumer_key** i **consumer_secret** – klucze API wygenerowane w WooCommerce.
+- **poll_sec** – interwał pętli integracji WooCommerce (heartbeat), tutaj co **10 sekund**.
 
 ### Konfiguracja cache
 
 Sekcja `cache` określa sposób buforowania danych produktów z WooCommerce:
 
-- **prime_on_start** – przy pierwszym uruchomieniu pobierany jest pełny stan produktów z Woo (pełna inicjalizacja cache).  
-- **sweep_interval_minutes** – pełne odświeżanie cache produktów co **360 minut (6h)**.  
-- **fields** – lista pól produktów pobieranych z WooCommerce:  
-  - id, sku – identyfikatory  
-  - name – nazwa produktu  
-  - regular_price, sale_price – ceny  
-  - stock_quantity, manage_stock – stany magazynowe  
-  - status – status produktu (np. publish / draft)  
-  - hurt_price, ean – pola rozszerzone (dane hurtowe i kod EAN)  
-  - date_modified_gmt – data ostatniej modyfikacji  
-  - type – typ produktu (np. simple, variable)  
+- **prime_on_start** – przy starcie pobierany jest pełny stan produktów z Woo (paginowany, 100/stronę).
+- **sweep_interval_minutes** – przyrostowe odświeżanie cache co **360 minut (6h)** – tylko produkty zmienione od ostatniego sweep (timestamp w tabeli `kvs`).
+- **fields** – lista pól produktów pobieranych z WooCommerce:
+  - id, sku – identyfikatory
+  - name – nazwa produktu
+  - regular_price, sale_price – ceny
+  - stock_quantity, manage_stock – stany magazynowe
+  - status – status produktu (np. publish / draft)
+  - global_unique_id – pole Woo "GTIN, UPC, EAN, lub ISBN"
+  - date_modified_gmt – data ostatniej modyfikacji
+  - type – typ produktu (np. simple, variable)
+
+### Pola customowe
+
+- **custom_fields** – lista mapowań dla customowych pól Woo/meta.
+- Dla każdego pola można wskazać:
+  - `read_top_level` – nazwę pola top-level zwracanego przez REST API
+  - `read_meta_key` – klucz w `meta_data`
+  - `write_top_level` – nazwę pola top-level używanego przy `PUT`
+  - `write_meta_key` – klucz meta używany przy `PUT`
+- Domyślny przykład: `hurt_price`, korzysta z meta `_hurt_price`.
+
+### Worker wysyłki (kolejka `woo_tasks`)
+
+Worker działa w tle i przetwarza kolejkę zadań atomicznie (claim → execute → verify → sync cache). Obsługiwane typy tasków:
+
+| Kind | Opis | Polityki skip |
+|---|---|---|
+| `ean.update` | Ustawienie EAN produktu w Woo | Skip jeśli produkt już ma jakikolwiek EAN; skip jeśli EAN zajęty przez inny produkt |
+| `stock.update` | Aktualizacja stanu magazynowego | Skip jeśli `manage_stock=false`; skip jeśli stan już się zgadza |
+| `price.update` | Aktualizacja ceny regularnej i hurtowej | Skip jeśli aktywna `sale_price > 0`; skip jeśli cena już się zgadza |
+
+Każdy task jest weryfikowany po aktualizacji (GET po PUT). Nieudane taski są requeue'owane.
+**Tworzenie nowych produktów w Woo jest [NIEGOTOWE].**
 
 ---
 
@@ -127,30 +158,58 @@ Sekcja `cache` określa sposób buforowania danych produktów z WooCommerce:
 
 Sekcja `importer` odpowiada za pobieranie danych z PC-Market:
 
-- **watch_dir** – katalog, w którym PCM umieszcza eksporty (np. exp_wyk_*.xml, exp_dok_*.xml). **[CZĘŚCIOWO GOTOWE: obecnie implementacja koncentruje się na `exp_wyk_*.xml`]**  
-  W tej konfiguracji: `~/pcm2www/imports`.  
+- **watch_dir** – katalog, w którym PCM umieszcza eksporty. W tej konfiguracji: `~/pcm2www/imports`.
 - **poll_sec** – co ile sekund sprawdzany jest katalog importu, tutaj co **5 sekund**.
+
+Aktualnie parsowany format: `exp_wyk_*.xml`. Inne typy eksportów PCM (`exp_dok_*` itp.) są **[NIEGOTOWE]**.
+
+Dedulikacja pliku odbywa się przez SHA256, nazwę pliku i `transmisja_id`. Obsługiwane kodowania: ISO-8859-2, Windows-1250 i inne.
 
 ---
 
 ## Przepływ danych
 
-1. **PC-Market 7** generuje pliki eksportu (exp_wyk, exp_dok, itd.) do katalogu `~/pcm2www/imports`.  
-2. **Importer** monitoruje katalog i wczytuje nowe pliki XML (co 5 sekund).  
-3. Dane są zapisywane do lokalnej bazy/cache integratora.  
-4. **WooCommerce worker** co 10 sekund sprawdza różnice i wysyła zmiany do WooCommerce REST API. **[NIEGOTOWE: worker nie jest obecnie uruchomiony]**  
-5. **Cache WooCommerce** jest odświeżany:
-   - pełny/paginowany odczyt produktów przy starcie (`prime_on_start=true`),  
-   - odświeżanie przyrostowe co `sweep_interval_minutes`,  
-   - osobny harmonogram stanów magazynowych co 2h **[NIEGOTOWE]**.  
+```
+PC-Market 7
+    └─ generuje exp_wyk_*.xml do watch_dir
+           ↓ co poll_sec sekund
+    [Importer] – SHA256 dedup, parsowanie XML, batch upsert
+    ├─ st_products (staging produktów)
+    └─ st_stocks (stany wg magazynów)
+           ↓ po każdym imporcie
+    [Linker] – dopasowanie EAN: st_products.kod ↔ woo_product_caches.ean
+    └─ link_issues (diagnostyki: brak EAN, duplikaty, brak w sklepie)
+           ↓
+    [Planner] – porównanie staging vs cache, generowanie woo_tasks
+    ├─ ean.update (jeśli EAN produktu niezgodny lub brak w Woo)
+    ├─ stock.update (jeśli stan magazynowy się różni)
+    └─ price.update (jeśli cena różni się i brak aktywnej promocji)
+           ↓
+    [Worker] – claim → fetch → verify → PUT → verify → sync cache
+    └─ woo_product_caches (aktualizowany po weryfikacji)
+           ↓
+    WooCommerce REST API
+```
+
+Cache Woo odświeżany jest niezależnie:
+- pełny paginowany odczyt przy starcie (`prime_on_start=true`),
+- przyrostowe odświeżanie co `sweep_interval_minutes`.
 
 ---
 
-## Podsumowanie
+## Podsumowanie statusu implementacji
 
-- Integrator działa w trybie **ciągłej pracy** (monitoring importu + cache Woo).  
-- Synchronizacja zmian PCM → WooCommerce jest **[NIEGOTOWA]** (brak aktywnego workera wysyłki).  
-- Aktualny harmonogram:
-  - import plików z katalogu wymiany: wg `importer.poll_sec` (np. 5s),  
-  - pętla integracji Woo: wg `woocommerce.poll_sec` (np. 10s, obecnie tryb dev/ping),  
-  - odświeżanie cache Woo: wg `cache.sweep_interval_minutes` (np. 360 min).
+| Funkcja | Status |
+|---|---|
+| Import `exp_wyk_*.xml` | Działa |
+| Dedup plików (SHA256, transmisja_id) | Działa |
+| Staging `st_products`, `st_stocks` | Działa |
+| Cache WooCommerce (prime + sweep) | Działa |
+| Linkowanie EAN (PCM ↔ Woo) | Działa |
+| Planowanie tasków (planner) | Działa |
+| Worker `stock.update` do Woo | Działa |
+| Worker `ean.update` do Woo | Działa |
+| Worker `price.update` do Woo | Działa |
+| Tworzenie nowych produktów w Woo | NIEGOTOWE |
+| Import innych typów eksportów PCM | NIEGOTOWE |
+| Pobieranie zamówień z Woo | NIEGOTOWE |

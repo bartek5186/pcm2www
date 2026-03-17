@@ -50,6 +50,14 @@ func (i *Importer) LinkProductsByEAN() error {
 
 	defer tx.Rollback()
 
+	// pełny rebuild powiązań musi zacząć od wyczyszczenia starych linków,
+	// inaczej planner może pracować na nieaktualnych TowarID z poprzednich przebiegów.
+	if err := tx.Model(&db.WooProductCache{}).
+		Session(&gorm.Session{AllowGlobalUpdate: true}).
+		Update("towar_id", nil).Error; err != nil {
+		return fmt.Errorf("błąd czyszczenia woo_product_caches.towar_id: %w", err)
+	}
+
 	// 4️⃣ Wczytaj staging (produkty z magazynu)
 	var st []struct {
 		TowarID int64

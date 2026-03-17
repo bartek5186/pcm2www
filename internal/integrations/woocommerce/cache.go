@@ -18,8 +18,6 @@ import (
 
 func (w *Woo) primeCache(ctx context.Context, gdb *gorm.DB) error {
 	base, _ := url.Parse(w.cfg.BaseURL)
-	// /wp-json/wc/v3/products with selected fields
-	// hurt_price is top leveled custom field
 	base.Path = "/wp-json/wc/v3/products"
 
 	perPage := 100
@@ -31,14 +29,12 @@ func (w *Woo) primeCache(ctx context.Context, gdb *gorm.DB) error {
 	}
 
 	for {
-
 		q := base.Query()
 		q.Set("orderby", "modified")
 		q.Set("order", "desc")
 		q.Set("per_page", strconv.Itoa(perPage))
 		q.Set("page", strconv.Itoa(page))
-
-		q.Set("_fields", w.cfg.Cache.Fields)
+		q.Set("_fields", w.productFields())
 
 		base.RawQuery = q.Encode()
 
@@ -80,11 +76,11 @@ func (w *Woo) primeCache(ctx context.Context, gdb *gorm.DB) error {
 				WooID:        uint(p.ID),
 				TowarID:      nil, // nie znamy jeszcze mapowania z PCM – zostanie uzupełnione później
 				Kod:          p.SKU,
-				Ean:          p.EAN,
+				Ean:          p.cacheEAN(),
 				Name:         p.Name,
 				PriceRegular: parsePrice(p.RegularPrice),
 				PriceSale:    parsePrice(p.SalePrice),
-				HurtPrice:    parsePrice(p.HurtPrice),
+				HurtPrice:    parsePrice(w.customFieldValue(p, "hurt_price")),
 				StockQty:     p.StockQuantity,
 				StockManaged: p.ManageStock,
 				Status:       p.Status,
@@ -160,12 +156,7 @@ func (w *Woo) sweepOnce(ctx context.Context, gdb *gorm.DB) {
 		q.Set("order", "desc")
 		q.Set("per_page", strconv.Itoa(perPage))
 		q.Set("page", strconv.Itoa(page))
-		// pobieramy wyłącznie potrzebne pola
-		fields := w.cfg.Cache.Fields
-		if strings.TrimSpace(fields) == "" {
-			fields = "id,sku,name,regular_price,sale_price,stock_quantity,manage_stock,status,date_modified_gmt,type,hurt_price,ean"
-		}
-		q.Set("_fields", fields)
+		q.Set("_fields", w.productFields())
 		base.RawQuery = q.Encode()
 
 		req, err := http.NewRequestWithContext(ctx, "GET", base.String(), nil)
@@ -204,7 +195,6 @@ func (w *Woo) sweepOnce(ctx context.Context, gdb *gorm.DB) {
 		stop := false
 
 		for _, p := range items {
-
 			tm, err := parseWooTimeUTC(p.DateModifiedGMT)
 			if err != nil {
 				// brak parsowania → zaloguj i pomiń
@@ -226,11 +216,11 @@ func (w *Woo) sweepOnce(ctx context.Context, gdb *gorm.DB) {
 				WooID:        uint(p.ID),
 				TowarID:      nil,
 				Kod:          p.SKU,
-				Ean:          p.EAN,
+				Ean:          p.cacheEAN(),
 				Name:         p.Name,
 				PriceRegular: parsePrice(p.RegularPrice),
 				PriceSale:    parsePrice(p.SalePrice),
-				HurtPrice:    parsePrice(p.HurtPrice),
+				HurtPrice:    parsePrice(w.customFieldValue(p, "hurt_price")),
 				StockQty:     p.StockQuantity,
 				StockManaged: p.ManageStock,
 				Status:       p.Status,
@@ -271,7 +261,6 @@ func (w *Woo) sweepOnce(ctx context.Context, gdb *gorm.DB) {
 	}
 
 }
-
 func parsePrice(s string) float64 {
 	s = strings.TrimSpace(strings.ReplaceAll(s, ",", "."))
 	if s == "" {

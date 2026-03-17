@@ -21,3 +21,6 @@ config.json
 
 # Windows explorer
 Thumbs.db
+
+reports/
+imports/
