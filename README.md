@@ -168,6 +168,19 @@ Worker działa w tle i przetwarza kolejkę zadań atomicznie (claim → execute 
 Każdy task jest weryfikowany po aktualizacji (GET po PUT). Nieudane taski są requeue'owane.
 **Tworzenie nowych produktów w Woo jest [NIEGOTOWE].**
 
+#### Stawki podatkowe [NIEGOTOWE]
+
+Podczas `price.update` należy również ustawiać klasę podatkową produktu na podstawie `vat_id` z PCM. Klasy podatkowe w WooCommerce nazwane są tak samo jak wartości `vat_id`:
+
+| vat_id (PCM) | Klasa podatkowa w Woo |
+|---|---|
+| `2300` | `2300` (23%) |
+| `800` | `800` (8%) |
+| `500` | `500` (5%) |
+| `-1` / `0` | zwolniony / 0% |
+
+Pole do ustawienia w API: `tax_class`. Do zaimplementowania przy okazji rozszerzenia `price.update`.
+
 ---
 
 ## Importer (PCM → Woo)
@@ -227,6 +240,7 @@ Cache Woo odświeżany jest niezależnie:
 | Worker `ean.update` do Woo | Działa |
 | Worker `price.update` do Woo | Działa |
 | Worker `availability.update` do Woo | Działa |
+| Synchronizacja klasy podatkowej (`tax_class`) | NIEGOTOWE |
 | Tworzenie nowych produktów w Woo | NIEGOTOWE |
 | Import innych typów eksportów PCM | NIEGOTOWE |
 | Pobieranie zamówień z Woo | NIEGOTOWE |
