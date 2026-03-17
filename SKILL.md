@@ -33,8 +33,9 @@ Implemented and active:
 - task planner (`planner.go`): compares staging vs cache, generates `woo_tasks` for EAN/stock/price updates
 - task worker (`worker.go`): atomically claims tasks, executes via WooCommerce REST API, verifies, syncs cache
   - `ean.update`: sets EAN on product (skips if product already has any EAN, or EAN taken)
-  - `stock.update`: updates stock quantity (skips if manage_stock=false, already matches, or PCM stock unchanged since last import — see prev_stock guard below)
-  - `price.update`: updates regular_price + hurt_price (skips if sale_price active, or already matches)
+  - `stock.update`: updates stock quantity (skips if cena_detal=0, manage_stock=false, already matches, or PCM stock unchanged since last import — see prev_stock guard below)
+  - `price.update`: updates regular_price + hurt_price (skips if cena_detal=0, sale_price active, or already matches)
+  - `availability.update`: sets manage_stock + stock_status + backorders based on cena_detal (see availability logic below)
 - retry/requeue logic on worker failure
 - CLI mode on non-Windows, systray app on Windows
 
@@ -141,6 +142,7 @@ When changing planner behavior:
 - planner only operates on linked products (towar_id filled); unlinked = skip
 - planner only operates on unambiguous 1:1 matches; >1 woo entry per towar_id = skip
 - **prev_stock guard**: `st_stocks.stan_prev` stores the previous PCM stock value (NULL on first import). If `stan == stan_prev` (PCM didn't change since last export), the planner skips `stock.update` even if the Woo cache shows a different value. This prevents overwriting stock reductions caused by online sales. If PCM stock changed (e.g. delivery, inventory correction), the task is generated with an absolute set value from PCM.
+- **availability logic**: `planAvailabilityUpdateTask()` is always called for every linked product. If `cena_detal == 0` → desired state is `manage_stock=false, stock_status=outofstock`. If `cena_detal > 0` → desired state is `manage_stock=true, backorders=notify`. Task is skipped only if cache already matches the desired state. `stock.update` and `price.update` are both skipped when `cena_detal=0`.
 
 When changing worker behavior:
 
@@ -174,6 +176,9 @@ When changing DB schema:
 - Worker skips `ean.update` if the product in Woo already has ANY EAN (conservative policy).
 - Worker skips `price.update` if `sale_price > 0` (does not override active promotions).
 - `st_stocks.stan_prev` is NULL for the first import of each warehouse row; planner treats NULL as "no history" and uses absolute set. Only on the second and subsequent imports does the prev_stock guard activate.
+- `stock_status` and `backorders` are always included in Woo API requests via `ensureProductFields()` regardless of the user's `fields` config string — do not remove them from the required list in `custom_fields.go`.
+- When `cena_detal=0`, planner skips both `stock.update` and `price.update` and only generates `availability.update`. Do not add price=0 writes to Woo — that would make products free.
+- `availability.update` task key encodes the desired state (`available` or `unavailable`) — changing price from 0 to non-zero generates a new task key, triggering a fresh task rather than a requeue.
 
 ## Preferred validation
 

@@ -124,6 +124,14 @@ func (w *Woo) executeWooTask(ctx context.Context, gdb *gorm.DB, task db.WooTask)
 		}
 		w.handlePriceUpdate(ctx, gdb, task, payload)
 
+	case db.WooTaskKindAvailabilityUpdate:
+		var payload db.WooAvailabilityPayload
+		if err := json.Unmarshal([]byte(task.PayloadJSON), &payload); err != nil {
+			w.failWooTask(gdb, task, fmt.Errorf("decode availability payload: %w", err))
+			return
+		}
+		w.handleAvailabilityUpdate(ctx, gdb, task, payload)
+
 	default:
 		w.failWooTask(gdb, task, fmt.Errorf("unsupported task kind: %s", task.Kind))
 	}
@@ -368,6 +376,82 @@ func (w *Woo) handlePriceUpdate(ctx context.Context, gdb *gorm.DB, task db.WooTa
 	w.logImportBatchStatus(gdb, task.ImportID)
 }
 
+func (w *Woo) handleAvailabilityUpdate(ctx context.Context, gdb *gorm.DB, task db.WooTask, payload db.WooAvailabilityPayload) {
+	product, err := w.fetchProduct(ctx, payload.WooID)
+	if err != nil {
+		w.failWooTask(gdb, task, fmt.Errorf("fetch live product before availability update: %w", err))
+		return
+	}
+
+	if payload.Unavailable {
+		if !product.ManageStock && product.StockStatus == "outofstock" {
+			if err := w.syncCacheFromVerifiedProduct(gdb, product, payload.TowarID); err != nil {
+				w.failWooTask(gdb, task, fmt.Errorf("cache sync after already-set unavailable: %w", err))
+				return
+			}
+			w.completeWooTask(gdb, task, "done", "", "")
+			w.log.Info().Uint("task_id", task.TaskID).Uint("woo_id", payload.WooID).
+				Msg("woo worker: product already unavailable and verified")
+			w.logImportBatchStatus(gdb, task.ImportID)
+			return
+		}
+		verified, err := w.updateAndVerifyProduct(ctx, payload.WooID, map[string]any{
+			"manage_stock": false,
+			"stock_status": "outofstock",
+		})
+		if err != nil {
+			w.failWooTask(gdb, task, fmt.Errorf("update availability (unavailable): %w", err))
+			return
+		}
+		if verified.ManageStock || verified.StockStatus != "outofstock" {
+			w.failWooTask(gdb, task, fmt.Errorf("availability verification mismatch: got manage_stock=%v stock_status=%q", verified.ManageStock, verified.StockStatus))
+			return
+		}
+		if err := w.syncCacheFromVerifiedProduct(gdb, verified, payload.TowarID); err != nil {
+			w.failWooTask(gdb, task, fmt.Errorf("cache sync after unavailable update: %w", err))
+			return
+		}
+		w.completeWooTask(gdb, task, "done", "", "")
+		w.log.Info().Uint("task_id", task.TaskID).Uint("woo_id", payload.WooID).
+			Msg("woo worker: product set unavailable (manage_stock=false, stock_status=outofstock)")
+		w.logImportBatchStatus(gdb, task.ImportID)
+		return
+	}
+
+	// available: manage_stock=true, backorders=notify
+	if product.ManageStock && product.Backorders == "notify" {
+		if err := w.syncCacheFromVerifiedProduct(gdb, product, payload.TowarID); err != nil {
+			w.failWooTask(gdb, task, fmt.Errorf("cache sync after already-set available: %w", err))
+			return
+		}
+		w.completeWooTask(gdb, task, "done", "", "")
+		w.log.Info().Uint("task_id", task.TaskID).Uint("woo_id", payload.WooID).
+			Msg("woo worker: product already available and verified")
+		w.logImportBatchStatus(gdb, task.ImportID)
+		return
+	}
+	verified, err := w.updateAndVerifyProduct(ctx, payload.WooID, map[string]any{
+		"manage_stock": true,
+		"backorders":   "notify",
+	})
+	if err != nil {
+		w.failWooTask(gdb, task, fmt.Errorf("update availability (available): %w", err))
+		return
+	}
+	if !verified.ManageStock || verified.Backorders != "notify" {
+		w.failWooTask(gdb, task, fmt.Errorf("availability verification mismatch: got manage_stock=%v backorders=%q", verified.ManageStock, verified.Backorders))
+		return
+	}
+	if err := w.syncCacheFromVerifiedProduct(gdb, verified, payload.TowarID); err != nil {
+		w.failWooTask(gdb, task, fmt.Errorf("cache sync after available update: %w", err))
+		return
+	}
+	w.completeWooTask(gdb, task, "done", "", "")
+	w.log.Info().Uint("task_id", task.TaskID).Uint("woo_id", payload.WooID).
+		Msg("woo worker: product set available (manage_stock=true, backorders=notify)")
+	w.logImportBatchStatus(gdb, task.ImportID)
+}
+
 func (w *Woo) fetchProduct(ctx context.Context, wooID uint) (wcProduct, error) {
 	base, err := url.Parse(w.cfg.BaseURL)
 	if err != nil {
@@ -452,6 +536,8 @@ func (w *Woo) syncCacheFromVerifiedProduct(gdb *gorm.DB, product wcProduct, towa
 		HurtPrice:    parsePrice(w.customFieldValue(product, "hurt_price")),
 		StockQty:     product.StockQuantity,
 		StockManaged: product.ManageStock,
+		StockStatus:  product.StockStatus,
+		Backorders:   product.Backorders,
 		Status:       product.Status,
 		Type:         product.Type,
 		DateModified: product.DateModifiedGMT,
@@ -461,7 +547,7 @@ func (w *Woo) syncCacheFromVerifiedProduct(gdb *gorm.DB, product wcProduct, towa
 		Columns: []clause.Column{{Name: "woo_id"}},
 		DoUpdates: clause.AssignmentColumns([]string{
 			"towar_id", "kod", "ean", "name", "price_regular", "price_sale", "hurt_price",
-			"stock_qty", "stock_managed", "status", "type", "date_modified",
+			"stock_qty", "stock_managed", "stock_status", "backorders", "status", "type", "date_modified",
 		}),
 	}).Create(&row).Error
 }

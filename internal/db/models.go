@@ -69,6 +69,8 @@ type WooProductCache struct {
 	HurtPrice    float64
 	StockQty     float64
 	StockManaged bool
+	StockStatus  string // instock / outofstock / onbackorder
+	Backorders   string // no / notify / yes
 	Status       string // publish/draft/trash
 	Type         string
 	DateModified string

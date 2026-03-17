@@ -1,9 +1,10 @@
 package db
 
 const (
-	WooTaskKindEANUpdate   = "ean.update"
-	WooTaskKindStockUpdate = "stock.update"
-	WooTaskKindPriceUpdate = "price.update"
+	WooTaskKindEANUpdate          = "ean.update"
+	WooTaskKindStockUpdate        = "stock.update"
+	WooTaskKindPriceUpdate        = "price.update"
+	WooTaskKindAvailabilityUpdate = "availability.update"
 )
 
 type WooEANUpdatePayload struct {
@@ -28,6 +29,18 @@ type WooStockUpdatePayload struct {
 	StockManaged  bool    `json:"stock_managed"`
 	SourceStock   float64 `json:"source_stock"`
 	SourceReserve float64 `json:"source_reserve"`
+}
+
+// WooAvailabilityPayload steruje manage_stock / stock_status / backorders.
+// Unavailable=true (cena_detal=0): manage_stock=false, stock_status=outofstock.
+// Unavailable=false (cena_detal>0): manage_stock=true, backorders=notify.
+type WooAvailabilityPayload struct {
+	ImportID    uint   `json:"import_id"`
+	WooID       uint   `json:"woo_id"`
+	TowarID     int64  `json:"towar_id"`
+	SKU         string `json:"sku"`
+	ProductName string `json:"product_name"`
+	Unavailable bool   `json:"unavailable"`
 }
 
 type WooPriceUpdatePayload struct {

@@ -124,10 +124,14 @@ Sekcja `cache` określa sposób buforowania danych produktów z WooCommerce:
   - name – nazwa produktu
   - regular_price, sale_price – ceny
   - stock_quantity, manage_stock – stany magazynowe
+  - stock_status – `instock` / `outofstock` / `onbackorder`
+  - backorders – `no` / `notify` / `yes`
   - status – status produktu (np. publish / draft)
   - global_unique_id – pole Woo "GTIN, UPC, EAN, lub ISBN"
   - date_modified_gmt – data ostatniej modyfikacji
   - type – typ produktu (np. simple, variable)
+
+> `stock_status` i `backorders` są zawsze dołączane do zapytań API niezależnie od wartości `fields` w konfiguracji.
 
 ### Pola customowe
 
@@ -146,8 +150,16 @@ Worker działa w tle i przetwarza kolejkę zadań atomicznie (claim → execute 
 | Kind | Opis | Polityki skip |
 |---|---|---|
 | `ean.update` | Ustawienie EAN produktu w Woo | Skip jeśli produkt już ma jakikolwiek EAN; skip jeśli EAN zajęty przez inny produkt |
-| `stock.update` | Aktualizacja stanu magazynowego | Skip jeśli `manage_stock=false`; skip jeśli stan już się zgadza; skip jeśli PCM nie zmienił stanu od poprzedniego importu (ochrona przed nadpisaniem sprzedaży) |
-| `price.update` | Aktualizacja ceny regularnej i hurtowej | Skip jeśli aktywna `sale_price > 0`; skip jeśli cena już się zgadza |
+| `stock.update` | Aktualizacja stanu magazynowego | Skip jeśli `cena_detal=0`; skip jeśli `manage_stock=false`; skip jeśli stan już się zgadza; skip jeśli PCM nie zmienił stanu od poprzedniego importu |
+| `price.update` | Aktualizacja ceny regularnej i hurtowej | Skip jeśli `cena_detal=0`; skip jeśli aktywna `sale_price > 0`; skip jeśli cena już się zgadza |
+| `availability.update` | Zarządzanie dostępnością produktu w sklepie | Skip jeśli stan w Woo już jest zgodny z oczekiwanym |
+
+**Logika dostępności (cena_detal z PCM):**
+
+| cena_detal | Akcja w Woo |
+|---|---|
+| `= 0` | `manage_stock=false` + `stock_status=outofstock` (produkt niedostępny, brak śledzenia) |
+| `> 0` | `manage_stock=true` + `backorders=notify` (śledź stan, zamówienia oczekujące z powiadomieniem) |
 
 #### Ochrona przed nadpisaniem sprzedaży online
 
@@ -214,6 +226,7 @@ Cache Woo odświeżany jest niezależnie:
 | Worker `stock.update` do Woo | Działa |
 | Worker `ean.update` do Woo | Działa |
 | Worker `price.update` do Woo | Działa |
+| Worker `availability.update` do Woo | Działa |
 | Tworzenie nowych produktów w Woo | NIEGOTOWE |
 | Import innych typów eksportów PCM | NIEGOTOWE |
 | Pobieranie zamówień z Woo | NIEGOTOWE |

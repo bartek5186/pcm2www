@@ -83,6 +83,8 @@ func (w *Woo) primeCache(ctx context.Context, gdb *gorm.DB) error {
 				HurtPrice:    parsePrice(w.customFieldValue(p, "hurt_price")),
 				StockQty:     p.StockQuantity,
 				StockManaged: p.ManageStock,
+				StockStatus:  p.StockStatus,
+				Backorders:   p.Backorders,
 				Status:       p.Status,
 				Type:         p.Type,
 				DateModified: p.DateModifiedGMT,
@@ -93,7 +95,7 @@ func (w *Woo) primeCache(ctx context.Context, gdb *gorm.DB) error {
 			Columns: []clause.Column{{Name: "woo_id"}}, // klucz unikalny
 			DoUpdates: clause.AssignmentColumns([]string{
 				"kod", "name", "price_regular", "price_sale", "hurt_price",
-				"stock_qty", "stock_managed", "status", "ean", "type", "date_modified",
+				"stock_qty", "stock_managed", "stock_status", "backorders", "status", "ean", "type", "date_modified",
 			}),
 		}).Create(&rows).Error; err != nil {
 			return fmt.Errorf("upsert cache page %d: %w", page, err)
@@ -223,6 +225,8 @@ func (w *Woo) sweepOnce(ctx context.Context, gdb *gorm.DB) {
 				HurtPrice:    parsePrice(w.customFieldValue(p, "hurt_price")),
 				StockQty:     p.StockQuantity,
 				StockManaged: p.ManageStock,
+				StockStatus:  p.StockStatus,
+				Backorders:   p.Backorders,
 				Status:       p.Status,
 				Type:         p.Type,
 				DateModified: p.DateModifiedGMT,
@@ -234,7 +238,7 @@ func (w *Woo) sweepOnce(ctx context.Context, gdb *gorm.DB) {
 				Columns: []clause.Column{{Name: "woo_id"}},
 				DoUpdates: clause.AssignmentColumns([]string{
 					"kod", "ean", "name", "price_regular", "price_sale", "hurt_price",
-					"stock_qty", "stock_managed", "status", "type", "date_modified",
+					"stock_qty", "stock_managed", "stock_status", "backorders", "status", "type", "date_modified",
 				}),
 			}).Create(&rows).Error; err != nil {
 				w.log.Error().Err(err).Msg("sweep upsert failed")

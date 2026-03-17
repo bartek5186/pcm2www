@@ -95,6 +95,8 @@ func ensureProductFields(fields string, customFields []CustomFieldConfig) string
 		"sale_price",
 		"stock_quantity",
 		"manage_stock",
+		"stock_status",
+		"backorders",
 		"status",
 		"date_modified_gmt",
 		"type",

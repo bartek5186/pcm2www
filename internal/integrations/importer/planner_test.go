@@ -120,8 +120,8 @@ func TestPlanWooTasksCreatesEANStockAndPriceTasks(t *testing.T) {
 	if err := gdb.Order("kind asc").Find(&tasks).Error; err != nil {
 		t.Fatal(err)
 	}
-	if len(tasks) != 3 {
-		t.Fatalf("expected 3 tasks, got %d", len(tasks))
+	if len(tasks) != 4 {
+		t.Fatalf("expected 4 tasks, got %d", len(tasks))
 	}
 
 	gotKinds := make(map[string]db.WooTask, len(tasks))
@@ -146,6 +146,9 @@ func TestPlanWooTasksCreatesEANStockAndPriceTasks(t *testing.T) {
 	}
 	if _, ok := gotKinds[db.WooTaskKindPriceUpdate]; !ok {
 		t.Fatal("missing price.update task")
+	}
+	if _, ok := gotKinds[db.WooTaskKindAvailabilityUpdate]; !ok {
+		t.Fatal("missing availability.update task")
 	}
 
 	var stockPayload db.WooStockUpdatePayload
@@ -195,6 +198,7 @@ func TestPlanWooTasksAppliesSafetyPolicy(t *testing.T) {
 		HurtPrice:    10,
 		StockQty:     1,
 		StockManaged: false,
+		Backorders:   "",
 	}).Error; err != nil {
 		t.Fatal(err)
 	}
@@ -211,12 +215,17 @@ func TestPlanWooTasksAppliesSafetyPolicy(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	var count int64
-	if err := gdb.Model(&db.WooTask{}).Count(&count).Error; err != nil {
+	var tasks []db.WooTask
+	if err := gdb.Find(&tasks).Error; err != nil {
 		t.Fatal(err)
 	}
-	if count != 0 {
-		t.Fatalf("expected 0 tasks due to safety policy, got %d", count)
+	// EAN/stock/price są zablokowane przez polityki bezpieczeństwa.
+	// availability.update jest słuszny — cache ma manage_stock=false przy cenie > 0.
+	if len(tasks) != 1 {
+		t.Fatalf("expected 1 task (availability.update), got %d", len(tasks))
+	}
+	if tasks[0].Kind != db.WooTaskKindAvailabilityUpdate {
+		t.Fatalf("expected availability.update task, got %s", tasks[0].Kind)
 	}
 }
 

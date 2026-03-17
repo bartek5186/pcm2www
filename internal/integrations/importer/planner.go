@@ -39,26 +39,30 @@ type plannerCacheRow struct {
 	HurtPrice    float64
 	StockQty     float64
 	StockManaged bool
+	StockStatus  string
+	Backorders   string
 }
 
 type plannerStats struct {
-	ImportID                 uint
-	Filename                 string
-	ProductsSeen             int
-	LinkedProducts           int
-	UnlinkedProducts         int
-	AmbiguousProducts        int
-	EANTasksCreated          int
-	EANTasksRequeued         int
-	StockTasksCreated        int
-	StockTasksRequeued       int
-	PriceTasksCreated        int
-	PriceTasksRequeued       int
-	ExistingPendingOrDone    int
-	PolicySkipEANPresent     int
-	PolicySkipDuplicateEAN   int
-	PolicySkipStockUnmanaged int
-	PolicySkipPriceSale      int
+	ImportID                    uint
+	Filename                    string
+	ProductsSeen                int
+	LinkedProducts              int
+	UnlinkedProducts            int
+	AmbiguousProducts           int
+	EANTasksCreated             int
+	EANTasksRequeued            int
+	StockTasksCreated           int
+	StockTasksRequeued          int
+	PriceTasksCreated           int
+	PriceTasksRequeued          int
+	AvailabilityTasksCreated    int
+	AvailabilityTasksRequeued   int
+	ExistingPendingOrDone       int
+	PolicySkipEANPresent        int
+	PolicySkipDuplicateEAN      int
+	PolicySkipStockUnmanaged    int
+	PolicySkipPriceSale         int
 }
 
 func (i *Importer) PlanWooTasksForImports(importIDs []uint) error {
@@ -135,6 +139,8 @@ func (i *Importer) PlanWooTasks(importID uint) error {
 		Int("skip_duplicate_ean", stats.PolicySkipDuplicateEAN).
 		Int("skip_stock_unmanaged", stats.PolicySkipStockUnmanaged).
 		Int("skip_price_sale", stats.PolicySkipPriceSale).
+		Int("availability_tasks_created", stats.AvailabilityTasksCreated).
+		Int("availability_tasks_requeued", stats.AvailabilityTasksRequeued).
 		Msg("woo task planning finished")
 
 	return nil
@@ -234,6 +240,19 @@ func (i *Importer) planWooTasksTx(tx *gorm.DB, importID uint) (plannerStats, err
 			}
 		}
 
+		if created, requeued, existed, err := i.planAvailabilityUpdateTask(tx, importID, row, cache); err != nil {
+			return stats, err
+		} else {
+			switch {
+			case created:
+				stats.AvailabilityTasksCreated++
+			case requeued:
+				stats.AvailabilityTasksRequeued++
+			case existed:
+				stats.ExistingPendingOrDone++
+			}
+		}
+
 		if created, requeued, existed, skipped, err := i.planStockUpdateTask(tx, importID, row, cache); err != nil {
 			return stats, err
 		} else {
@@ -307,7 +326,7 @@ func loadPlannerCacheRows(tx *gorm.DB, towarIDs []int64) ([]plannerCacheRow, err
 	}
 	if err := tx.Model(&db.WooProductCache{}).
 		Where("towar_id IN ?", towarIDs).
-		Select("woo_id", "towar_id", "kod", "ean", "name", "price_regular", "price_sale", "hurt_price", "stock_qty", "stock_managed").
+		Select("woo_id", "towar_id", "kod", "ean", "name", "price_regular", "price_sale", "hurt_price", "stock_qty", "stock_managed", "stock_status", "backorders").
 		Find(&rows).Error; err != nil {
 		return nil, err
 	}
@@ -389,6 +408,9 @@ func (i *Importer) planEANUpdateTask(tx *gorm.DB, importID uint, src plannerSour
 }
 
 func (i *Importer) planStockUpdateTask(tx *gorm.DB, importID uint, src plannerSourceRow, cache plannerCacheRow) (created, requeued, existed, skipped bool, err error) {
+	if floatAlmostEqual(src.CenaDetal, 0) {
+		return false, false, false, false, nil // produkt niedostępny (brak ceny) — stock obsługuje availability.update
+	}
 	desiredStock := math.Max(src.TotalStock-src.TotalReserved, 0)
 	if floatAlmostEqual(cache.StockQty, desiredStock) {
 		return false, false, false, false, nil
@@ -446,6 +468,9 @@ func (i *Importer) planStockUpdateTask(tx *gorm.DB, importID uint, src plannerSo
 }
 
 func (i *Importer) planPriceUpdateTask(tx *gorm.DB, importID uint, src plannerSourceRow, cache plannerCacheRow) (created, requeued, existed, skipped bool, err error) {
+	if floatAlmostEqual(src.CenaDetal, 0) {
+		return false, false, false, false, nil // produkt niedostępny (brak ceny) — nie ustawiaj ceny 0
+	}
 	desiredRegular := src.CenaDetal
 	desiredHurt := src.CenaHurtowa
 	if floatAlmostEqual(cache.PriceRegular, desiredRegular) && floatAlmostEqual(cache.HurtPrice, desiredHurt) {
@@ -485,6 +510,44 @@ func (i *Importer) planPriceUpdateTask(tx *gorm.DB, importID uint, src plannerSo
 	}
 	created, requeued, existed, err = enqueueWooTask(tx, task)
 	return created, requeued, existed, false, err
+}
+
+func (i *Importer) planAvailabilityUpdateTask(tx *gorm.DB, importID uint, src plannerSourceRow, cache plannerCacheRow) (created, requeued, existed bool, err error) {
+	unavailable := floatAlmostEqual(src.CenaDetal, 0)
+
+	if unavailable {
+		if !cache.StockManaged && cache.StockStatus == "outofstock" {
+			return false, false, false, nil
+		}
+	} else {
+		if cache.StockManaged && cache.Backorders == "notify" {
+			return false, false, false, nil
+		}
+	}
+
+	stateKey := "available"
+	if unavailable {
+		stateKey = "unavailable"
+	}
+
+	payload := db.WooAvailabilityPayload{
+		ImportID:    importID,
+		WooID:       cache.WooID,
+		TowarID:     src.TowarID,
+		SKU:         cache.Kod,
+		ProductName: cache.Name,
+		Unavailable: unavailable,
+	}
+	task := db.WooTask{
+		TaskKey:     buildTaskKey(db.WooTaskKindAvailabilityUpdate, cache.WooID, stateKey),
+		ImportID:    importID,
+		TowarID:     ptrInt64(src.TowarID),
+		WooID:       ptrUint(cache.WooID),
+		Kind:        db.WooTaskKindAvailabilityUpdate,
+		PayloadJSON: mustJSON(payload),
+		Status:      "pending",
+	}
+	return enqueueWooTask(tx, task)
 }
 
 func enqueueWooTask(tx *gorm.DB, task db.WooTask) (created, requeued, existed bool, err error) {
