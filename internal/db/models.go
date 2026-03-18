@@ -67,6 +67,7 @@ type WooProductCache struct {
 	PriceRegular float64
 	PriceSale    float64
 	HurtPrice    float64
+	TaxClass     string  // "" = standard, "2300", "800", "500", "zero-rate"
 	StockQty     float64
 	StockManaged bool
 	StockStatus  string // instock / outofstock / onbackorder

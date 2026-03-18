@@ -19,6 +19,7 @@ type plannerSourceRow struct {
 	TowarID        int64
 	Kod            string
 	Nazwa          string
+	VatID          int64
 	CenaDetal      float64
 	CenaHurtowa    float64
 	AktywnyWSI     bool
@@ -37,6 +38,7 @@ type plannerCacheRow struct {
 	PriceRegular float64
 	PriceSale    float64
 	HurtPrice    float64
+	TaxClass     string
 	StockQty     float64
 	StockManaged bool
 	StockStatus  string
@@ -294,6 +296,7 @@ SELECT
 	p.towar_id,
 	p.kod,
 	p.nazwa,
+	p.vat_id,
 	p.cena_detal,
 	p.cena_hurtowa,
 	p.aktywny_wsi,
@@ -309,6 +312,7 @@ GROUP BY
 	p.towar_id,
 	p.kod,
 	p.nazwa,
+	p.vat_id,
 	p.cena_detal,
 	p.cena_hurtowa,
 	p.aktywny_wsi,
@@ -326,7 +330,7 @@ func loadPlannerCacheRows(tx *gorm.DB, towarIDs []int64) ([]plannerCacheRow, err
 	}
 	if err := tx.Model(&db.WooProductCache{}).
 		Where("towar_id IN ?", towarIDs).
-		Select("woo_id", "towar_id", "kod", "ean", "name", "price_regular", "price_sale", "hurt_price", "stock_qty", "stock_managed", "stock_status", "backorders").
+		Select("woo_id", "towar_id", "kod", "ean", "name", "price_regular", "price_sale", "hurt_price", "tax_class", "stock_qty", "stock_managed", "stock_status", "backorders").
 		Find(&rows).Error; err != nil {
 		return nil, err
 	}
@@ -467,13 +471,29 @@ func (i *Importer) planStockUpdateTask(tx *gorm.DB, importID uint, src plannerSo
 	return created, requeued, existed, false, err
 }
 
+func vatIDToTaxClass(vatID int64) string {
+	switch vatID {
+	case 2300:
+		return "2300"
+	case 800:
+		return "800"
+	case 500:
+		return "500"
+	case 0, -1: // 0% i ZW
+		return "zero-rate"
+	default:
+		return "" // standard rate (23% fallback)
+	}
+}
+
 func (i *Importer) planPriceUpdateTask(tx *gorm.DB, importID uint, src plannerSourceRow, cache plannerCacheRow) (created, requeued, existed, skipped bool, err error) {
 	if floatAlmostEqual(src.CenaDetal, 0) {
 		return false, false, false, false, nil // produkt niedostępny (brak ceny) — nie ustawiaj ceny 0
 	}
 	desiredRegular := src.CenaDetal
 	desiredHurt := src.CenaHurtowa
-	if floatAlmostEqual(cache.PriceRegular, desiredRegular) && floatAlmostEqual(cache.HurtPrice, desiredHurt) {
+	desiredTaxClass := vatIDToTaxClass(src.VatID)
+	if floatAlmostEqual(cache.PriceRegular, desiredRegular) && floatAlmostEqual(cache.HurtPrice, desiredHurt) && cache.TaxClass == desiredTaxClass {
 		return false, false, false, false, nil
 	}
 	if cache.PriceSale > 0 {
@@ -488,19 +508,21 @@ func (i *Importer) planPriceUpdateTask(tx *gorm.DB, importID uint, src plannerSo
 	}
 
 	payload := db.WooPriceUpdatePayload{
-		ImportID:       importID,
-		WooID:          cache.WooID,
-		TowarID:        src.TowarID,
-		SKU:            cache.Kod,
-		ProductName:    cache.Name,
-		CurrentRegular: cache.PriceRegular,
-		DesiredRegular: desiredRegular,
-		CurrentSale:    cache.PriceSale,
-		CurrentHurt:    cache.HurtPrice,
-		DesiredHurt:    desiredHurt,
+		ImportID:        importID,
+		WooID:           cache.WooID,
+		TowarID:         src.TowarID,
+		SKU:             cache.Kod,
+		ProductName:     cache.Name,
+		CurrentRegular:  cache.PriceRegular,
+		DesiredRegular:  desiredRegular,
+		CurrentSale:     cache.PriceSale,
+		CurrentHurt:     cache.HurtPrice,
+		DesiredHurt:     desiredHurt,
+		CurrentTaxClass: cache.TaxClass,
+		DesiredTaxClass: desiredTaxClass,
 	}
 	task := db.WooTask{
-		TaskKey:     buildTaskKey(db.WooTaskKindPriceUpdate, cache.WooID, normalizeFloatKey(desiredRegular), normalizeFloatKey(desiredHurt)),
+		TaskKey:     buildTaskKey(db.WooTaskKindPriceUpdate, cache.WooID, normalizeFloatKey(desiredRegular), normalizeFloatKey(desiredHurt), desiredTaxClass),
 		ImportID:    importID,
 		TowarID:     ptrInt64(src.TowarID),
 		WooID:       ptrUint(cache.WooID),

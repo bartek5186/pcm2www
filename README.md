@@ -151,7 +151,7 @@ Worker działa w tle i przetwarza kolejkę zadań atomicznie (claim → execute 
 |---|---|---|
 | `ean.update` | Ustawienie EAN produktu w Woo | Skip jeśli produkt już ma jakikolwiek EAN; skip jeśli EAN zajęty przez inny produkt |
 | `stock.update` | Aktualizacja stanu magazynowego | Skip jeśli `cena_detal=0`; skip jeśli `manage_stock=false`; skip jeśli stan już się zgadza; skip jeśli PCM nie zmienił stanu od poprzedniego importu |
-| `price.update` | Aktualizacja ceny regularnej i hurtowej | Skip jeśli `cena_detal=0`; skip jeśli aktywna `sale_price > 0`; skip jeśli cena już się zgadza |
+| `price.update` | Aktualizacja ceny regularnej, hurtowej i klasy podatkowej (`tax_class`) | Skip jeśli `cena_detal=0`; skip jeśli aktywna `sale_price > 0`; skip jeśli cena i klasa podatkowa już się zgadzają |
 | `availability.update` | Zarządzanie dostępnością produktu w sklepie | Skip jeśli stan w Woo już jest zgodny z oczekiwanym |
 
 **Logika dostępności (cena_detal z PCM):**
@@ -168,18 +168,20 @@ Worker działa w tle i przetwarza kolejkę zadań atomicznie (claim → execute 
 Każdy task jest weryfikowany po aktualizacji (GET po PUT). Nieudane taski są requeue'owane.
 **Tworzenie nowych produktów w Woo jest [NIEGOTOWE].**
 
-#### Stawki podatkowe [NIEGOTOWE]
+#### Stawki podatkowe
 
-Podczas `price.update` należy również ustawiać klasę podatkową produktu na podstawie `vat_id` z PCM. Klasy podatkowe w WooCommerce nazwane są tak samo jak wartości `vat_id`:
+Podczas `price.update` ustawiana jest klasa podatkowa produktu na podstawie `vat_id` z PCM (`vatIDToTaxClass` w plannerze). Mapowanie:
 
-| vat_id (PCM) | Klasa podatkowa w Woo |
+| vat_id (PCM) | Klasa podatkowa w Woo (`tax_class`) |
 |---|---|
-| `2300` | `2300` (23%) |
-| `800` | `800` (8%) |
-| `500` | `500` (5%) |
-| `-1` / `0` | zwolniony / 0% |
+| `2300` | `"2300"` (23%) |
+| `800` | `"800"` (8%) |
+| `500` | `"500"` (5%) |
+| `0` | `"zero-rate"` (0%) |
+| `-1` | `"zero-rate"` (ZW) |
+| inny / brak | `""` (standard rate — fallback 23%) |
 
-Pole do ustawienia w API: `tax_class`. Do zaimplementowania przy okazji rozszerzenia `price.update`.
+Pole `TaxClass` jest trzymane w `WooProductCache` i synchronizowane przez `syncCacheFromVerifiedProduct`.
 
 ---
 
@@ -236,11 +238,12 @@ Cache Woo odświeżany jest niezależnie:
 | Cache WooCommerce (prime + sweep) | Działa |
 | Linkowanie EAN (PCM ↔ Woo) | Działa |
 | Planowanie tasków (planner) | Działa |
-| Worker `stock.update` do Woo | Działa |
-| Worker `ean.update` do Woo | Działa |
-| Worker `price.update` do Woo | Działa |
-| Worker `availability.update` do Woo | Działa |
-| Synchronizacja klasy podatkowej (`tax_class`) | NIEGOTOWE |
+| Worker `stock.update` do Woo | Działa (batch 20) |
+| Worker `ean.update` do Woo | Działa (sekwencyjnie) |
+| Worker `price.update` do Woo | Działa (batch 20) |
+| Worker `availability.update` do Woo | Działa (sekwencyjnie) |
+| Równoległe workery (`workers` w config) | Działa (domyślnie 3) |
+| Synchronizacja klasy podatkowej (`tax_class`) | Działa |
 | Tworzenie nowych produktów w Woo | NIEGOTOWE |
 | Import innych typów eksportów PCM | NIEGOTOWE |
 | Pobieranie zamówień z Woo | NIEGOTOWE |

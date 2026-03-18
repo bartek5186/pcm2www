@@ -24,6 +24,7 @@ type Config struct {
 	ConsumerKey  string              `json:"consumer_key"`
 	ConsumerSec  string              `json:"consumer_secret"`
 	PollSec      int                 `json:"poll_sec"` // co ile sekund sprawdzać (dev)
+	Workers      int                 `json:"workers"`  // liczba równoległych workerów (domyślnie 3)
 	Cache        WooCache            `json:"cache"`
 	CustomFields []CustomFieldConfig `json:"custom_fields,omitempty"`
 }
@@ -62,8 +63,10 @@ func (w *Woo) Start(ctx context.Context) error {
 		go w.runCacheSweeper(w.ctx, gdb)
 	}
 
-	// 2) odpal worker zadań (jeśli już masz woo_tasks)
-	go w.runWorker(w.ctx, gdb)
+	// 2) odpal N workerów zadań
+	for range w.numWorkers() {
+		go w.runWorker(w.ctx, gdb)
+	}
 
 	// 3) dev ping/ticker (jak miałeś)
 	ticker := time.NewTicker(w.interval())
@@ -86,6 +89,13 @@ func (w *Woo) Stop() {
 	if w.cancel != nil {
 		w.cancel()
 	}
+}
+
+func (w *Woo) numWorkers() int {
+	if w.cfg.Workers > 0 {
+		return w.cfg.Workers
+	}
+	return 3
 }
 
 func (w *Woo) interval() time.Duration {

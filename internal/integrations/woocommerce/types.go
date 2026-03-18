@@ -23,6 +23,7 @@ type wcProduct struct {
 	RegularPrice    string                     `json:"regular_price"` // string w Woo
 	SalePrice       string                     `json:"sale_price"`    // string
 	HurtPrice       string                     `json:"hurt_price"`
+	TaxClass        string                     `json:"tax_class"`
 	ManageStock     bool                       `json:"manage_stock"`
 	StockQuantity   float64                    `json:"stock_quantity"`
 	StockStatus     string                     `json:"stock_status"` // instock / outofstock / onbackorder
@@ -62,6 +63,7 @@ func (p *wcProduct) UnmarshalJSON(data []byte) error {
 		"regular_price",
 		"sale_price",
 		"hurt_price",
+		"tax_class",
 		"manage_stock",
 		"stock_quantity",
 		"stock_status",

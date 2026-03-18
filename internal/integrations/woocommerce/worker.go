@@ -34,12 +34,38 @@ func (w *Woo) runWorker(ctx context.Context, gdb *gorm.DB) {
 	}
 }
 
+// batchableKinds to typy tasków obsługiwane przez batch GET+POST.
+var batchableKinds = []string{db.WooTaskKindPriceUpdate, db.WooTaskKindStockUpdate}
+
+const workerBatchSize = 20
+
 func (w *Woo) workerTick(ctx context.Context, gdb *gorm.DB) {
 	for {
 		if ctx.Err() != nil {
 			return
 		}
-		task, err := claimNextWooTask(gdb)
+
+		// 1) Spróbuj batch dla każdego batchable kind
+		didBatch := false
+		for _, kind := range batchableKinds {
+			tasks, err := claimNextNWooTasksOfKind(gdb, kind, workerBatchSize)
+			if err != nil {
+				w.log.Error().Err(err).Str("kind", kind).Msg("woo worker: claim batch failed")
+				return
+			}
+			if len(tasks) == 0 {
+				continue
+			}
+			w.executeBatch(ctx, gdb, kind, tasks)
+			didBatch = true
+			break
+		}
+		if didBatch {
+			continue
+		}
+
+		// 2) Pozostałe typy (ean.update, availability.update) — sekwencyjnie
+		task, err := claimNextSequentialWooTask(gdb)
 		if err != nil {
 			w.log.Error().Err(err).Msg("woo worker: claim task failed")
 			return
@@ -54,10 +80,26 @@ func (w *Woo) workerTick(ctx context.Context, gdb *gorm.DB) {
 	}
 }
 
-func claimNextWooTask(gdb *gorm.DB) (*db.WooTask, error) {
+// claimNextNWooTasksOfKind atomicznie claim-uje do n tasków danego kind.
+func claimNextNWooTasksOfKind(gdb *gorm.DB, kind string, n int) ([]db.WooTask, error) {
+	var claimed []db.WooTask
+	for range n {
+		task, err := claimOneWooTaskOfKind(gdb, kind)
+		if err != nil {
+			return claimed, err
+		}
+		if task == nil {
+			break
+		}
+		claimed = append(claimed, *task)
+	}
+	return claimed, nil
+}
+
+func claimOneWooTaskOfKind(gdb *gorm.DB, kind string) (*db.WooTask, error) {
 	var tasks []db.WooTask
 	if err := gdb.
-		Where("status = ?", "pending").
+		Where("status = ? AND kind = ?", "pending", kind).
 		Order("created_at ASC, task_id ASC").
 		Limit(1).
 		Find(&tasks).Error; err != nil {
@@ -66,8 +108,26 @@ func claimNextWooTask(gdb *gorm.DB) (*db.WooTask, error) {
 	if len(tasks) == 0 {
 		return nil, nil
 	}
-	task := tasks[0]
+	return claimWooTask(gdb, tasks[0])
+}
 
+// claimNextSequentialWooTask claim-uje jeden task spoza batchableKinds.
+func claimNextSequentialWooTask(gdb *gorm.DB) (*db.WooTask, error) {
+	var tasks []db.WooTask
+	if err := gdb.
+		Where("status = ? AND kind NOT IN ?", "pending", batchableKinds).
+		Order("created_at ASC, task_id ASC").
+		Limit(1).
+		Find(&tasks).Error; err != nil {
+		return nil, err
+	}
+	if len(tasks) == 0 {
+		return nil, nil
+	}
+	return claimWooTask(gdb, tasks[0])
+}
+
+func claimWooTask(gdb *gorm.DB, task db.WooTask) (*db.WooTask, error) {
 	now := time.Now()
 	res := gdb.Model(&db.WooTask{}).
 		Where("task_id = ? AND status = ?", task.TaskID, "pending").
@@ -83,7 +143,6 @@ func claimNextWooTask(gdb *gorm.DB) (*db.WooTask, error) {
 	if res.RowsAffected == 0 {
 		return nil, nil
 	}
-
 	task.Status = "running"
 	task.StartedAt = &now
 	task.Attempts++
@@ -326,7 +385,8 @@ func (w *Woo) handlePriceUpdate(ctx context.Context, gdb *gorm.DB, task db.WooTa
 		return
 
 	case floatAlmostEqual(parsePrice(product.RegularPrice), payload.DesiredRegular) &&
-		floatAlmostEqual(parsePrice(w.customFieldValue(product, "hurt_price")), payload.DesiredHurt):
+		floatAlmostEqual(parsePrice(w.customFieldValue(product, "hurt_price")), payload.DesiredHurt) &&
+		product.TaxClass == payload.DesiredTaxClass:
 		if err := w.syncCacheFromVerifiedProduct(gdb, product, payload.TowarID); err != nil {
 			w.failWooTask(gdb, task, fmt.Errorf("cache sync after already-set price: %w", err))
 			return
@@ -338,6 +398,7 @@ func (w *Woo) handlePriceUpdate(ctx context.Context, gdb *gorm.DB, task db.WooTa
 			Uint("woo_id", payload.WooID).
 			Float64("regular_price", payload.DesiredRegular).
 			Float64("hurt_price", payload.DesiredHurt).
+			Str("tax_class", payload.DesiredTaxClass).
 			Msg("woo worker: price already set and verified")
 		w.logImportBatchStatus(gdb, task.ImportID)
 		return
@@ -345,6 +406,7 @@ func (w *Woo) handlePriceUpdate(ctx context.Context, gdb *gorm.DB, task db.WooTa
 
 	body := map[string]any{
 		"regular_price": formatWooPrice(payload.DesiredRegular),
+		"tax_class":     payload.DesiredTaxClass,
 	}
 	w.applyCustomFieldPayload(body, "hurt_price", formatWooPrice(payload.DesiredHurt))
 
@@ -354,10 +416,12 @@ func (w *Woo) handlePriceUpdate(ctx context.Context, gdb *gorm.DB, task db.WooTa
 		return
 	}
 	if !floatAlmostEqual(parsePrice(verified.RegularPrice), payload.DesiredRegular) ||
-		!floatAlmostEqual(parsePrice(w.customFieldValue(verified, "hurt_price")), payload.DesiredHurt) {
+		!floatAlmostEqual(parsePrice(w.customFieldValue(verified, "hurt_price")), payload.DesiredHurt) ||
+		verified.TaxClass != payload.DesiredTaxClass {
 		w.failWooTask(gdb, task, fmt.Errorf(
-			"price verification mismatch: got regular=%v hurt=%v want regular=%v hurt=%v",
-			parsePrice(verified.RegularPrice), parsePrice(w.customFieldValue(verified, "hurt_price")), payload.DesiredRegular, payload.DesiredHurt,
+			"price verification mismatch: got regular=%v hurt=%v tax_class=%v want regular=%v hurt=%v tax_class=%v",
+			parsePrice(verified.RegularPrice), parsePrice(w.customFieldValue(verified, "hurt_price")), verified.TaxClass,
+			payload.DesiredRegular, payload.DesiredHurt, payload.DesiredTaxClass,
 		))
 		return
 	}
@@ -372,6 +436,7 @@ func (w *Woo) handlePriceUpdate(ctx context.Context, gdb *gorm.DB, task db.WooTa
 		Uint("woo_id", payload.WooID).
 		Float64("verified_regular", parsePrice(verified.RegularPrice)).
 		Float64("verified_hurt", parsePrice(w.customFieldValue(verified, "hurt_price"))).
+		Str("verified_tax_class", verified.TaxClass).
 		Msg("woo worker: price updated and verified")
 	w.logImportBatchStatus(gdb, task.ImportID)
 }
@@ -534,6 +599,7 @@ func (w *Woo) syncCacheFromVerifiedProduct(gdb *gorm.DB, product wcProduct, towa
 		PriceRegular: parsePrice(product.RegularPrice),
 		PriceSale:    parsePrice(product.SalePrice),
 		HurtPrice:    parsePrice(w.customFieldValue(product, "hurt_price")),
+		TaxClass:     product.TaxClass,
 		StockQty:     product.StockQuantity,
 		StockManaged: product.ManageStock,
 		StockStatus:  product.StockStatus,
@@ -546,7 +612,7 @@ func (w *Woo) syncCacheFromVerifiedProduct(gdb *gorm.DB, product wcProduct, towa
 	return gdb.Clauses(clause.OnConflict{
 		Columns: []clause.Column{{Name: "woo_id"}},
 		DoUpdates: clause.AssignmentColumns([]string{
-			"towar_id", "kod", "ean", "name", "price_regular", "price_sale", "hurt_price",
+			"towar_id", "kod", "ean", "name", "price_regular", "price_sale", "hurt_price", "tax_class",
 			"stock_qty", "stock_managed", "stock_status", "backorders", "status", "type", "date_modified",
 		}),
 	}).Create(&row).Error
@@ -667,4 +733,326 @@ func isWorkerContextInterruption(err error) bool {
 
 func ptrInt64(v int64) *int64 {
 	return &v
+}
+
+// executeBatch przekazuje grupę tasków do właściwego batch handlera.
+func (w *Woo) executeBatch(ctx context.Context, gdb *gorm.DB, kind string, tasks []db.WooTask) {
+	switch kind {
+	case db.WooTaskKindPriceUpdate:
+		w.handlePriceUpdateBatch(ctx, gdb, tasks)
+	case db.WooTaskKindStockUpdate:
+		w.handleStockUpdateBatch(ctx, gdb, tasks)
+	}
+}
+
+func (w *Woo) handlePriceUpdateBatch(ctx context.Context, gdb *gorm.DB, tasks []db.WooTask) {
+	// 1. Parsuj payloady
+	type entry struct {
+		task    db.WooTask
+		payload db.WooPriceUpdatePayload
+	}
+	entries := make([]entry, 0, len(tasks))
+	for _, task := range tasks {
+		var p db.WooPriceUpdatePayload
+		if err := json.Unmarshal([]byte(task.PayloadJSON), &p); err != nil {
+			w.failWooTask(gdb, task, fmt.Errorf("unmarshal payload: %w", err))
+			continue
+		}
+		entries = append(entries, entry{task, p})
+	}
+	if len(entries) == 0 {
+		return
+	}
+
+	// 2. Batch GET
+	wooIDs := make([]uint, len(entries))
+	for i, e := range entries {
+		wooIDs[i] = e.payload.WooID
+	}
+	live, err := w.fetchProductsBatch(ctx, wooIDs)
+	if err != nil {
+		for _, e := range entries {
+			w.failWooTask(gdb, e.task, fmt.Errorf("batch GET: %w", err))
+		}
+		return
+	}
+
+	// 3. Policy check + buduj listę do aktualizacji
+	type pending struct {
+		entry  entry
+		update map[string]any
+	}
+	var toUpdate []pending
+	byWooID := make(map[uint]entry, len(entries))
+
+	for _, e := range entries {
+		product, ok := live[e.payload.WooID]
+		if !ok {
+			w.failWooTask(gdb, e.task, fmt.Errorf("product %d missing in batch GET response", e.payload.WooID))
+			continue
+		}
+		switch {
+		case parsePrice(product.SalePrice) > 0:
+			_ = w.syncCacheFromVerifiedProduct(gdb, product, e.payload.TowarID)
+			w.completeWooTask(gdb, e.task, "skipped", fmt.Sprintf("policy skip: live sale_price=%v", product.SalePrice), "")
+		case floatAlmostEqual(parsePrice(product.RegularPrice), e.payload.DesiredRegular) &&
+			floatAlmostEqual(parsePrice(w.customFieldValue(product, "hurt_price")), e.payload.DesiredHurt) &&
+			product.TaxClass == e.payload.DesiredTaxClass:
+			_ = w.syncCacheFromVerifiedProduct(gdb, product, e.payload.TowarID)
+			w.completeWooTask(gdb, e.task, "done", "", "")
+		default:
+			upd := map[string]any{
+				"id":            e.payload.WooID,
+				"regular_price": formatWooPrice(e.payload.DesiredRegular),
+				"tax_class":     e.payload.DesiredTaxClass,
+			}
+			w.applyCustomFieldPayload(upd, "hurt_price", formatWooPrice(e.payload.DesiredHurt))
+			toUpdate = append(toUpdate, pending{e, upd})
+			byWooID[e.payload.WooID] = e
+		}
+	}
+
+	if len(toUpdate) == 0 {
+		return
+	}
+
+	// 4. Batch POST
+	updates := make([]map[string]any, len(toUpdate))
+	for i, p := range toUpdate {
+		updates[i] = p.update
+	}
+	verified, err := w.batchUpdateProducts(ctx, updates)
+	if err != nil {
+		for _, p := range toUpdate {
+			w.failWooTask(gdb, p.entry.task, fmt.Errorf("batch POST: %w", err))
+		}
+		return
+	}
+
+	// 5. Weryfikacja i sync cache
+	verifiedIDs := make(map[uint]struct{}, len(verified))
+	for _, prod := range verified {
+		e, ok := byWooID[uint(prod.ID)]
+		if !ok {
+			continue
+		}
+		verifiedIDs[uint(prod.ID)] = struct{}{}
+		if !floatAlmostEqual(parsePrice(prod.RegularPrice), e.payload.DesiredRegular) ||
+			!floatAlmostEqual(parsePrice(w.customFieldValue(prod, "hurt_price")), e.payload.DesiredHurt) ||
+			prod.TaxClass != e.payload.DesiredTaxClass {
+			w.failWooTask(gdb, e.task, fmt.Errorf(
+				"price verification mismatch: got regular=%v hurt=%v tax=%v want regular=%v hurt=%v tax=%v",
+				parsePrice(prod.RegularPrice), parsePrice(w.customFieldValue(prod, "hurt_price")), prod.TaxClass,
+				e.payload.DesiredRegular, e.payload.DesiredHurt, e.payload.DesiredTaxClass,
+			))
+			continue
+		}
+		_ = w.syncCacheFromVerifiedProduct(gdb, prod, e.payload.TowarID)
+		w.completeWooTask(gdb, e.task, "done", "", "")
+	}
+	// Taski których Woo nie zwróciło w odpowiedzi → fail
+	for _, p := range toUpdate {
+		if _, ok := verifiedIDs[p.entry.payload.WooID]; !ok {
+			w.failWooTask(gdb, p.entry.task, fmt.Errorf("product %d missing in batch POST response", p.entry.payload.WooID))
+		}
+	}
+	w.logImportBatchStatus(gdb, tasks[0].ImportID)
+}
+
+func (w *Woo) handleStockUpdateBatch(ctx context.Context, gdb *gorm.DB, tasks []db.WooTask) {
+	// 1. Parsuj payloady
+	type entry struct {
+		task    db.WooTask
+		payload db.WooStockUpdatePayload
+	}
+	entries := make([]entry, 0, len(tasks))
+	for _, task := range tasks {
+		var p db.WooStockUpdatePayload
+		if err := json.Unmarshal([]byte(task.PayloadJSON), &p); err != nil {
+			w.failWooTask(gdb, task, fmt.Errorf("unmarshal payload: %w", err))
+			continue
+		}
+		entries = append(entries, entry{task, p})
+	}
+	if len(entries) == 0 {
+		return
+	}
+
+	// 2. Batch GET
+	wooIDs := make([]uint, len(entries))
+	for i, e := range entries {
+		wooIDs[i] = e.payload.WooID
+	}
+	live, err := w.fetchProductsBatch(ctx, wooIDs)
+	if err != nil {
+		for _, e := range entries {
+			w.failWooTask(gdb, e.task, fmt.Errorf("batch GET: %w", err))
+		}
+		return
+	}
+
+	// 3. Policy check + buduj listę do aktualizacji
+	type pending struct {
+		entry  entry
+		update map[string]any
+	}
+	var toUpdate []pending
+	byWooID := make(map[uint]entry, len(entries))
+
+	for _, e := range entries {
+		product, ok := live[e.payload.WooID]
+		if !ok {
+			w.failWooTask(gdb, e.task, fmt.Errorf("product %d missing in batch GET response", e.payload.WooID))
+			continue
+		}
+		switch {
+		case !product.ManageStock:
+			_ = w.syncCacheFromVerifiedProduct(gdb, product, e.payload.TowarID)
+			w.completeWooTask(gdb, e.task, "skipped", "policy skip: live product has manage_stock=false", "")
+		case floatAlmostEqual(product.StockQuantity, e.payload.DesiredStock):
+			_ = w.syncCacheFromVerifiedProduct(gdb, product, e.payload.TowarID)
+			w.completeWooTask(gdb, e.task, "done", "", "")
+		default:
+			toUpdate = append(toUpdate, pending{e, map[string]any{
+				"id":             e.payload.WooID,
+				"stock_quantity": e.payload.DesiredStock,
+			}})
+			byWooID[e.payload.WooID] = e
+		}
+	}
+
+	if len(toUpdate) == 0 {
+		return
+	}
+
+	// 4. Batch POST
+	updates := make([]map[string]any, len(toUpdate))
+	for i, p := range toUpdate {
+		updates[i] = p.update
+	}
+	verified, err := w.batchUpdateProducts(ctx, updates)
+	if err != nil {
+		for _, p := range toUpdate {
+			w.failWooTask(gdb, p.entry.task, fmt.Errorf("batch POST: %w", err))
+		}
+		return
+	}
+
+	// 5. Weryfikacja i sync cache
+	verifiedIDs := make(map[uint]struct{}, len(verified))
+	for _, prod := range verified {
+		e, ok := byWooID[uint(prod.ID)]
+		if !ok {
+			continue
+		}
+		verifiedIDs[uint(prod.ID)] = struct{}{}
+		if !floatAlmostEqual(prod.StockQuantity, e.payload.DesiredStock) {
+			w.failWooTask(gdb, e.task, fmt.Errorf("stock verification mismatch: got %v want %v", prod.StockQuantity, e.payload.DesiredStock))
+			continue
+		}
+		_ = w.syncCacheFromVerifiedProduct(gdb, prod, e.payload.TowarID)
+		w.completeWooTask(gdb, e.task, "done", "", "")
+	}
+	for _, p := range toUpdate {
+		if _, ok := verifiedIDs[p.entry.payload.WooID]; !ok {
+			w.failWooTask(gdb, p.entry.task, fmt.Errorf("product %d missing in batch POST response", p.entry.payload.WooID))
+		}
+	}
+	w.logImportBatchStatus(gdb, tasks[0].ImportID)
+}
+
+// fetchProductsBatch pobiera wiele produktów jednym GET (?include=id1,id2,...).
+func (w *Woo) fetchProductsBatch(ctx context.Context, wooIDs []uint) (map[uint]wcProduct, error) {
+	if len(wooIDs) == 0 {
+		return nil, nil
+	}
+	base, err := url.Parse(w.cfg.BaseURL)
+	if err != nil {
+		return nil, err
+	}
+	base.Path = "/wp-json/wc/v3/products"
+	ids := make([]string, len(wooIDs))
+	for i, id := range wooIDs {
+		ids[i] = strconv.FormatUint(uint64(id), 10)
+	}
+	q := base.Query()
+	q.Set("include", strings.Join(ids, ","))
+	q.Set("per_page", strconv.Itoa(len(wooIDs)))
+	q.Set("_fields", w.productFields())
+	base.RawQuery = q.Encode()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, base.String(), nil)
+	if err != nil {
+		return nil, err
+	}
+	req.SetBasicAuth(w.cfg.ConsumerKey, w.cfg.ConsumerSec)
+	req.Header.Set("User-Agent", "PCM2WWW/1.0")
+
+	resp, err := w.client().Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("batch GET http %d", resp.StatusCode)
+	}
+
+	var products []wcProduct
+	if err := json.NewDecoder(resp.Body).Decode(&products); err != nil {
+		return nil, err
+	}
+	result := make(map[uint]wcProduct, len(products))
+	for _, p := range products {
+		result[uint(p.ID)] = p
+	}
+	return result, nil
+}
+
+type wcBatchResponse struct {
+	Update []wcProduct `json:"update"`
+}
+
+// batchUpdateProducts wysyła POST /products/batch {"update": [...]} i zwraca zaktualizowane produkty.
+func (w *Woo) batchUpdateProducts(ctx context.Context, updates []map[string]any) ([]wcProduct, error) {
+	if len(updates) == 0 {
+		return nil, nil
+	}
+	base, err := url.Parse(w.cfg.BaseURL)
+	if err != nil {
+		return nil, err
+	}
+	base.Path = "/wp-json/wc/v3/products/batch"
+
+	rawBody, err := json.Marshal(map[string]any{"update": updates})
+	if err != nil {
+		return nil, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, base.String(), bytes.NewReader(rawBody))
+	if err != nil {
+		return nil, err
+	}
+	req.SetBasicAuth(w.cfg.ConsumerKey, w.cfg.ConsumerSec)
+	req.Header.Set("User-Agent", "PCM2WWW/1.0")
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := w.client().Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		var payload map[string]any
+		if err := json.NewDecoder(resp.Body).Decode(&payload); err == nil {
+			if raw, merr := json.Marshal(payload); merr == nil {
+				return nil, fmt.Errorf("batch POST http %d: %s", resp.StatusCode, string(raw))
+			}
+		}
+		return nil, fmt.Errorf("batch POST http %d", resp.StatusCode)
+	}
+
+	var batchResp wcBatchResponse
+	if err := json.NewDecoder(resp.Body).Decode(&batchResp); err != nil {
+		return nil, err
+	}
+	return batchResp.Update, nil
 }

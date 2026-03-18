@@ -44,14 +44,16 @@ type WooAvailabilityPayload struct {
 }
 
 type WooPriceUpdatePayload struct {
-	ImportID       uint    `json:"import_id"`
-	WooID          uint    `json:"woo_id"`
-	TowarID        int64   `json:"towar_id"`
-	SKU            string  `json:"sku"`
-	ProductName    string  `json:"product_name"`
-	CurrentRegular float64 `json:"current_regular"`
-	DesiredRegular float64 `json:"desired_regular"`
-	CurrentSale    float64 `json:"current_sale"`
-	CurrentHurt    float64 `json:"current_hurt"`
-	DesiredHurt    float64 `json:"desired_hurt"`
+	ImportID        uint    `json:"import_id"`
+	WooID           uint    `json:"woo_id"`
+	TowarID         int64   `json:"towar_id"`
+	SKU             string  `json:"sku"`
+	ProductName     string  `json:"product_name"`
+	CurrentRegular  float64 `json:"current_regular"`
+	DesiredRegular  float64 `json:"desired_regular"`
+	CurrentSale     float64 `json:"current_sale"`
+	CurrentHurt     float64 `json:"current_hurt"`
+	DesiredHurt     float64 `json:"desired_hurt"`
+	CurrentTaxClass string  `json:"current_tax_class"`
+	DesiredTaxClass string  `json:"desired_tax_class"`
 }

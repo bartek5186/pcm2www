@@ -36,6 +36,7 @@ type WooDefaults struct {
 	ConsumerKey  string                          `json:"consumer_key"`
 	ConsumerSec  string                          `json:"consumer_secret"`
 	PollSec      int                             `json:"poll_sec"`
+	Workers      int                             `json:"workers"`
 	Cache        woocommerce.WooCache            `json:"cache"`
 	CustomFields []woocommerce.CustomFieldConfig `json:"custom_fields,omitempty"`
 }
@@ -53,6 +54,7 @@ func LoadOrCreate(path string) (*Config, bool, error) {
 				ConsumerKey: "ck_xxx",
 				ConsumerSec: "cs_xxx",
 				PollSec:     10,
+				Workers:     3,
 				Cache: woocommerce.WooCache{
 					PrimeOnStart:         true,
 					SweepIntervalMinutes: 360, //6h

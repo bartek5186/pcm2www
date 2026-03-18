@@ -31,10 +31,12 @@ Implemented and active:
 - Woo-to-staging linking by EAN (`st_products.kod` → `woo_product_caches.ean`, digits-only match)
 - diagnostics in `link_issues` (missing EAN, missing in shop, duplicate EAN, missing in magazine)
 - task planner (`planner.go`): compares staging vs cache, generates `woo_tasks` for EAN/stock/price updates
-- task worker (`worker.go`): atomically claims tasks, executes via WooCommerce REST API, verifies, syncs cache
+- task worker (`worker.go`): N parallel workers (default 3, config `workers`), each runs a tight loop:
+  - **batch kinds** (`price.update`, `stock.update`): claim up to 20 tasks → batch GET (`?include=`) → policy check per product → batch POST (`/products/batch`) → verify per product → sync cache
+  - **sequential kinds** (`ean.update`, `availability.update`): claim 1 → GET → policy check → PUT → verify → sync cache
   - `ean.update`: sets EAN on product (skips if product already has any EAN, or EAN taken)
-  - `stock.update`: updates stock quantity (skips if cena_detal=0, manage_stock=false, already matches, or PCM stock unchanged since last import — see prev_stock guard below)
-  - `price.update`: updates regular_price + hurt_price (skips if cena_detal=0, sale_price active, or already matches)
+  - `stock.update`: updates stock quantity (skips if manage_stock=false, already matches)
+  - `price.update`: updates regular_price + hurt_price + tax_class (skips if sale_price active, or already matches); `tax_class` mapped from `vat_id` via `vatIDToTaxClass()` in planner: 2300→"2300", 800→"800", 500→"500", 0/-1→"zero-rate", other→"" (standard)
   - `availability.update`: sets manage_stock + stock_status + backorders based on cena_detal (see availability logic below)
 - retry/requeue logic on worker failure
 - CLI mode on non-Windows, systray app on Windows
