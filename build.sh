@@ -3,7 +3,7 @@ set -euo pipefail
 
 ver="${1:-1.0.0}"        # wersja z parametru albo 1.0.0
 pkg="./"
-out="bin/pcm2www-sync.exe"
+out="bin/ProcyonSyncer.exe"
 
 mkdir -p bin
 

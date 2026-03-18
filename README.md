@@ -1,5 +1,7 @@
 # Integracja PCM2WWW z WooCommerce
 
+![Procyon PCM2WWW](procyon-pcm-2-www.png)
+
 Ten plik opisuje integrację systemu **PC-Market 7 (PCM)** poprzez narzędzie **pcm2www** z platformą **WooCommerce**.
 Integrator działa cyklicznie, pobiera dane z katalogu eksportów PC-Market (`exp_wyk_*.xml`) oraz synchronizuje je z WooCommerce przy użyciu REST API.
 
