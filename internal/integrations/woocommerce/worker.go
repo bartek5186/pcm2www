@@ -35,7 +35,7 @@ func (w *Woo) runWorker(ctx context.Context, gdb *gorm.DB) {
 }
 
 // batchableKinds to typy tasków obsługiwane przez batch GET+POST.
-var batchableKinds = []string{db.WooTaskKindPriceUpdate, db.WooTaskKindStockUpdate}
+var batchableKinds = []string{db.WooTaskKindPriceUpdate, db.WooTaskKindStockUpdate, db.WooTaskKindAvailabilityUpdate}
 
 const workerBatchSize = 20
 
@@ -97,18 +97,28 @@ func claimNextNWooTasksOfKind(gdb *gorm.DB, kind string, n int) ([]db.WooTask, e
 }
 
 func claimOneWooTaskOfKind(gdb *gorm.DB, kind string) (*db.WooTask, error) {
-	var tasks []db.WooTask
-	if err := gdb.
-		Where("status = ? AND kind = ?", "pending", kind).
-		Order("created_at ASC, task_id ASC").
-		Limit(1).
-		Find(&tasks).Error; err != nil {
-		return nil, err
+	for range 5 {
+		var tasks []db.WooTask
+		if err := gdb.
+			Where("status = ? AND kind = ?", "pending", kind).
+			Order("created_at ASC, task_id ASC").
+			Limit(1).
+			Find(&tasks).Error; err != nil {
+			return nil, err
+		}
+		if len(tasks) == 0 {
+			return nil, nil // naprawdę brak tasków
+		}
+		task, err := claimWooTask(gdb, tasks[0])
+		if err != nil {
+			return nil, err
+		}
+		if task != nil {
+			return task, nil // sukces
+		}
+		// RowsAffected=0 — inny worker przejął ten task, retry SELECT
 	}
-	if len(tasks) == 0 {
-		return nil, nil
-	}
-	return claimWooTask(gdb, tasks[0])
+	return nil, nil
 }
 
 // claimNextSequentialWooTask claim-uje jeden task spoza batchableKinds.
@@ -742,6 +752,8 @@ func (w *Woo) executeBatch(ctx context.Context, gdb *gorm.DB, kind string, tasks
 		w.handlePriceUpdateBatch(ctx, gdb, tasks)
 	case db.WooTaskKindStockUpdate:
 		w.handleStockUpdateBatch(ctx, gdb, tasks)
+	case db.WooTaskKindAvailabilityUpdate:
+		w.handleAvailabilityUpdateBatch(ctx, gdb, tasks)
 	}
 }
 
@@ -948,6 +960,114 @@ func (w *Woo) handleStockUpdateBatch(ctx context.Context, gdb *gorm.DB, tasks []
 		verifiedIDs[uint(prod.ID)] = struct{}{}
 		if !floatAlmostEqual(prod.StockQuantity, e.payload.DesiredStock) {
 			w.failWooTask(gdb, e.task, fmt.Errorf("stock verification mismatch: got %v want %v", prod.StockQuantity, e.payload.DesiredStock))
+			continue
+		}
+		_ = w.syncCacheFromVerifiedProduct(gdb, prod, e.payload.TowarID)
+		w.completeWooTask(gdb, e.task, "done", "", "")
+	}
+	for _, p := range toUpdate {
+		if _, ok := verifiedIDs[p.entry.payload.WooID]; !ok {
+			w.failWooTask(gdb, p.entry.task, fmt.Errorf("product %d missing in batch POST response", p.entry.payload.WooID))
+		}
+	}
+	w.logImportBatchStatus(gdb, tasks[0].ImportID)
+}
+
+func (w *Woo) handleAvailabilityUpdateBatch(ctx context.Context, gdb *gorm.DB, tasks []db.WooTask) {
+	type entry struct {
+		task    db.WooTask
+		payload db.WooAvailabilityPayload
+	}
+	entries := make([]entry, 0, len(tasks))
+	for _, task := range tasks {
+		var p db.WooAvailabilityPayload
+		if err := json.Unmarshal([]byte(task.PayloadJSON), &p); err != nil {
+			w.failWooTask(gdb, task, fmt.Errorf("unmarshal payload: %w", err))
+			continue
+		}
+		entries = append(entries, entry{task, p})
+	}
+	if len(entries) == 0 {
+		return
+	}
+
+	wooIDs := make([]uint, len(entries))
+	for i, e := range entries {
+		wooIDs[i] = e.payload.WooID
+	}
+	live, err := w.fetchProductsBatch(ctx, wooIDs)
+	if err != nil {
+		for _, e := range entries {
+			w.failWooTask(gdb, e.task, fmt.Errorf("batch GET: %w", err))
+		}
+		return
+	}
+
+	type pending struct {
+		entry  entry
+		update map[string]any
+	}
+	var toUpdate []pending
+	byWooID := make(map[uint]entry, len(entries))
+
+	for _, e := range entries {
+		product, ok := live[e.payload.WooID]
+		if !ok {
+			w.failWooTask(gdb, e.task, fmt.Errorf("product %d missing in batch GET response", e.payload.WooID))
+			continue
+		}
+		alreadySet := func() bool {
+			if e.payload.Unavailable {
+				return !product.ManageStock && product.StockStatus == "outofstock"
+			}
+			return product.ManageStock && product.Backorders == "notify"
+		}()
+		if alreadySet {
+			_ = w.syncCacheFromVerifiedProduct(gdb, product, e.payload.TowarID)
+			w.completeWooTask(gdb, e.task, "done", "", "")
+			continue
+		}
+		var upd map[string]any
+		if e.payload.Unavailable {
+			upd = map[string]any{"id": e.payload.WooID, "manage_stock": false, "stock_status": "outofstock"}
+		} else {
+			upd = map[string]any{"id": e.payload.WooID, "manage_stock": true, "backorders": "notify"}
+		}
+		toUpdate = append(toUpdate, pending{e, upd})
+		byWooID[e.payload.WooID] = e
+	}
+
+	if len(toUpdate) == 0 {
+		return
+	}
+
+	updates := make([]map[string]any, len(toUpdate))
+	for i, p := range toUpdate {
+		updates[i] = p.update
+	}
+	verified, err := w.batchUpdateProducts(ctx, updates)
+	if err != nil {
+		for _, p := range toUpdate {
+			w.failWooTask(gdb, p.entry.task, fmt.Errorf("batch POST: %w", err))
+		}
+		return
+	}
+
+	verifiedIDs := make(map[uint]struct{}, len(verified))
+	for _, prod := range verified {
+		e, ok := byWooID[uint(prod.ID)]
+		if !ok {
+			continue
+		}
+		verifiedIDs[uint(prod.ID)] = struct{}{}
+		ok = func() bool {
+			if e.payload.Unavailable {
+				return !prod.ManageStock && prod.StockStatus == "outofstock"
+			}
+			return prod.ManageStock && prod.Backorders == "notify"
+		}()
+		if !ok {
+			w.failWooTask(gdb, e.task, fmt.Errorf("availability verification mismatch: manage_stock=%v stock_status=%q backorders=%q", prod.ManageStock, prod.StockStatus, prod.Backorders))
 			continue
 		}
 		_ = w.syncCacheFromVerifiedProduct(gdb, prod, e.payload.TowarID)
