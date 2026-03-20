@@ -27,8 +27,9 @@ type wcProduct struct {
 	ManageStock     bool                       `json:"manage_stock"`
 	StockQuantity   float64                    `json:"stock_quantity"`
 	StockStatus     string                     `json:"stock_status"` // instock / outofstock / onbackorder
-	Backorders      string                     `json:"backorders"`   // no / notify / yes
-	Type            string                     `json:"type"`         // "simple","variable", etc.
+	Backorders        string                     `json:"backorders"`         // no / notify / yes
+	CatalogVisibility string                     `json:"catalog_visibility"` // visible / hidden / catalog / search
+	Type              string                     `json:"type"`               // "simple","variable", etc.
 	MetaData        []wcMetaData               `json:"meta_data"`
 	DateModifiedGMT string                     `json:"date_modified_gmt"`
 	ExtraFields     map[string]json.RawMessage `json:"-"`
@@ -68,6 +69,7 @@ func (p *wcProduct) UnmarshalJSON(data []byte) error {
 		"stock_quantity",
 		"stock_status",
 		"backorders",
+		"catalog_visibility",
 		"type",
 		"meta_data",
 		"date_modified_gmt",

@@ -40,9 +40,10 @@ type plannerCacheRow struct {
 	HurtPrice    float64
 	TaxClass     string
 	StockQty     float64
-	StockManaged bool
-	StockStatus  string
-	Backorders   string
+	StockManaged      bool
+	StockStatus       string
+	Backorders        string
+	CatalogVisibility string
 }
 
 type plannerStats struct {
@@ -330,7 +331,7 @@ func loadPlannerCacheRows(tx *gorm.DB, towarIDs []int64) ([]plannerCacheRow, err
 	}
 	if err := tx.Model(&db.WooProductCache{}).
 		Where("towar_id IN ?", towarIDs).
-		Select("woo_id", "towar_id", "kod", "ean", "name", "price_regular", "price_sale", "hurt_price", "tax_class", "stock_qty", "stock_managed", "stock_status", "backorders").
+		Select("woo_id", "towar_id", "kod", "ean", "name", "price_regular", "price_sale", "hurt_price", "tax_class", "stock_qty", "stock_managed", "stock_status", "backorders", "catalog_visibility").
 		Find(&rows).Error; err != nil {
 		return nil, err
 	}
@@ -538,11 +539,11 @@ func (i *Importer) planAvailabilityUpdateTask(tx *gorm.DB, importID uint, src pl
 	unavailable := floatAlmostEqual(src.CenaDetal, 0)
 
 	if unavailable {
-		if !cache.StockManaged && cache.StockStatus == "outofstock" {
+		if !cache.StockManaged && cache.StockStatus == "outofstock" && cache.CatalogVisibility == "hidden" {
 			return false, false, false, nil
 		}
 	} else {
-		if cache.StockManaged && cache.Backorders == "notify" {
+		if cache.StockManaged && cache.Backorders == "notify" && cache.CatalogVisibility != "hidden" {
 			return false, false, false, nil
 		}
 	}

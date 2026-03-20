@@ -459,7 +459,7 @@ func (w *Woo) handleAvailabilityUpdate(ctx context.Context, gdb *gorm.DB, task d
 	}
 
 	if payload.Unavailable {
-		if !product.ManageStock && product.StockStatus == "outofstock" {
+		if !product.ManageStock && product.StockStatus == "outofstock" && product.CatalogVisibility == "hidden" {
 			if err := w.syncCacheFromVerifiedProduct(gdb, product, payload.TowarID); err != nil {
 				w.failWooTask(gdb, task, fmt.Errorf("cache sync after already-set unavailable: %w", err))
 				return
@@ -471,15 +471,16 @@ func (w *Woo) handleAvailabilityUpdate(ctx context.Context, gdb *gorm.DB, task d
 			return
 		}
 		verified, err := w.updateAndVerifyProduct(ctx, payload.WooID, map[string]any{
-			"manage_stock": false,
-			"stock_status": "outofstock",
+			"manage_stock":       false,
+			"stock_status":       "outofstock",
+			"catalog_visibility": "hidden",
 		})
 		if err != nil {
 			w.failWooTask(gdb, task, fmt.Errorf("update availability (unavailable): %w", err))
 			return
 		}
-		if verified.ManageStock || verified.StockStatus != "outofstock" {
-			w.failWooTask(gdb, task, fmt.Errorf("availability verification mismatch: got manage_stock=%v stock_status=%q", verified.ManageStock, verified.StockStatus))
+		if verified.ManageStock || verified.StockStatus != "outofstock" || verified.CatalogVisibility != "hidden" {
+			w.failWooTask(gdb, task, fmt.Errorf("availability verification mismatch: got manage_stock=%v stock_status=%q catalog_visibility=%q", verified.ManageStock, verified.StockStatus, verified.CatalogVisibility))
 			return
 		}
 		if err := w.syncCacheFromVerifiedProduct(gdb, verified, payload.TowarID); err != nil {
@@ -493,8 +494,8 @@ func (w *Woo) handleAvailabilityUpdate(ctx context.Context, gdb *gorm.DB, task d
 		return
 	}
 
-	// available: manage_stock=true, backorders=notify
-	if product.ManageStock && product.Backorders == "notify" {
+	// available: manage_stock=true, backorders=notify, catalog_visibility=visible
+	if product.ManageStock && product.Backorders == "notify" && product.CatalogVisibility != "hidden" {
 		if err := w.syncCacheFromVerifiedProduct(gdb, product, payload.TowarID); err != nil {
 			w.failWooTask(gdb, task, fmt.Errorf("cache sync after already-set available: %w", err))
 			return
@@ -506,8 +507,9 @@ func (w *Woo) handleAvailabilityUpdate(ctx context.Context, gdb *gorm.DB, task d
 		return
 	}
 	verified, err := w.updateAndVerifyProduct(ctx, payload.WooID, map[string]any{
-		"manage_stock": true,
-		"backorders":   "notify",
+		"manage_stock":       true,
+		"backorders":         "notify",
+		"catalog_visibility": "visible",
 	})
 	if err != nil {
 		w.failWooTask(gdb, task, fmt.Errorf("update availability (available): %w", err))
@@ -611,19 +613,20 @@ func (w *Woo) syncCacheFromVerifiedProduct(gdb *gorm.DB, product wcProduct, towa
 		HurtPrice:    parsePrice(w.customFieldValue(product, "hurt_price")),
 		TaxClass:     product.TaxClass,
 		StockQty:     product.StockQuantity,
-		StockManaged: product.ManageStock,
-		StockStatus:  product.StockStatus,
-		Backorders:   product.Backorders,
-		Status:       product.Status,
-		Type:         product.Type,
-		DateModified: product.DateModifiedGMT,
+		StockManaged:      product.ManageStock,
+		StockStatus:       product.StockStatus,
+		Backorders:        product.Backorders,
+		CatalogVisibility: product.CatalogVisibility,
+		Status:            product.Status,
+		Type:              product.Type,
+		DateModified:      product.DateModifiedGMT,
 	}
 
 	return gdb.Clauses(clause.OnConflict{
 		Columns: []clause.Column{{Name: "woo_id"}},
 		DoUpdates: clause.AssignmentColumns([]string{
 			"towar_id", "kod", "ean", "name", "price_regular", "price_sale", "hurt_price", "tax_class",
-			"stock_qty", "stock_managed", "stock_status", "backorders", "status", "type", "date_modified",
+			"stock_qty", "stock_managed", "stock_status", "backorders", "catalog_visibility", "status", "type", "date_modified",
 		}),
 	}).Create(&row).Error
 }
@@ -1018,9 +1021,9 @@ func (w *Woo) handleAvailabilityUpdateBatch(ctx context.Context, gdb *gorm.DB, t
 		}
 		alreadySet := func() bool {
 			if e.payload.Unavailable {
-				return !product.ManageStock && product.StockStatus == "outofstock"
+				return !product.ManageStock && product.StockStatus == "outofstock" && product.CatalogVisibility == "hidden"
 			}
-			return product.ManageStock && product.Backorders == "notify"
+			return product.ManageStock && product.Backorders == "notify" && product.CatalogVisibility != "hidden"
 		}()
 		if alreadySet {
 			_ = w.syncCacheFromVerifiedProduct(gdb, product, e.payload.TowarID)
@@ -1029,9 +1032,9 @@ func (w *Woo) handleAvailabilityUpdateBatch(ctx context.Context, gdb *gorm.DB, t
 		}
 		var upd map[string]any
 		if e.payload.Unavailable {
-			upd = map[string]any{"id": e.payload.WooID, "manage_stock": false, "stock_status": "outofstock"}
+			upd = map[string]any{"id": e.payload.WooID, "manage_stock": false, "stock_status": "outofstock", "catalog_visibility": "hidden"}
 		} else {
-			upd = map[string]any{"id": e.payload.WooID, "manage_stock": true, "backorders": "notify"}
+			upd = map[string]any{"id": e.payload.WooID, "manage_stock": true, "backorders": "notify", "catalog_visibility": "visible"}
 		}
 		toUpdate = append(toUpdate, pending{e, upd})
 		byWooID[e.payload.WooID] = e
@@ -1062,12 +1065,12 @@ func (w *Woo) handleAvailabilityUpdateBatch(ctx context.Context, gdb *gorm.DB, t
 		verifiedIDs[uint(prod.ID)] = struct{}{}
 		ok = func() bool {
 			if e.payload.Unavailable {
-				return !prod.ManageStock && prod.StockStatus == "outofstock"
+				return !prod.ManageStock && prod.StockStatus == "outofstock" && prod.CatalogVisibility == "hidden"
 			}
 			return prod.ManageStock && prod.Backorders == "notify"
 		}()
 		if !ok {
-			w.failWooTask(gdb, e.task, fmt.Errorf("availability verification mismatch: manage_stock=%v stock_status=%q backorders=%q", prod.ManageStock, prod.StockStatus, prod.Backorders))
+			w.failWooTask(gdb, e.task, fmt.Errorf("availability verification mismatch: manage_stock=%v stock_status=%q backorders=%q catalog_visibility=%q", prod.ManageStock, prod.StockStatus, prod.Backorders, prod.CatalogVisibility))
 			continue
 		}
 		_ = w.syncCacheFromVerifiedProduct(gdb, prod, e.payload.TowarID)
