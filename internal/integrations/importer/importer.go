@@ -270,7 +270,12 @@ func (i *Importer) processFile(importID uint, fullPath string) error {
 	stockBatch := make([]db.StStock, 0, batchSize)
 
 	tx := i.db.Begin()
-	defer tx.Rollback()
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback().Error
+		}
+	}()
 
 	insProducts, insStocks := 0, 0
 
@@ -419,6 +424,7 @@ func (i *Importer) processFile(importID uint, fullPath string) error {
 		i.log.Error().Err(err).Msg("tx commit failed")
 		return err
 	}
+	committed = true
 
 	i.log.Info().
 		Uint("import_id", importID).

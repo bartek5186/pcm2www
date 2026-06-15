@@ -26,6 +26,12 @@ func cleanEAN(s string) string {
 // Skasuje i przebuduje całą tabelę link_issues od zera.
 func (i *Importer) LinkProductsByEAN() error {
 	tx := i.db.Begin()
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback().Error
+		}
+	}()
 
 	// 1️⃣ Wyczyść istniejące problemy (pełny rebuild)
 	if err := tx.Unscoped().Session(&gorm.Session{AllowGlobalUpdate: true}).Delete(&db.LinkIssue{}).Error; err != nil {
@@ -35,7 +41,11 @@ func (i *Importer) LinkProductsByEAN() error {
 	// 2️⃣ Upewnij się, że Woo cache istnieje
 	if !tx.Migrator().HasTable(&db.WooProductCache{}) {
 		i.log.Warn().Msg("linker: Woo cache table missing, skip (first run)")
-		return tx.Commit().Error
+		if err := tx.Commit().Error; err != nil {
+			return err
+		}
+		committed = true
+		return nil
 	}
 
 	// 3️⃣ Sprawdź, czy cache nie jest pusty
@@ -45,10 +55,12 @@ func (i *Importer) LinkProductsByEAN() error {
 	}
 	if cacheCount == 0 {
 		i.log.Warn().Msg("linker: Woo cache empty, skip (will retry next cycle)")
-		return tx.Commit().Error
+		if err := tx.Commit().Error; err != nil {
+			return err
+		}
+		committed = true
+		return nil
 	}
-
-	defer tx.Rollback()
 
 	// pełny rebuild powiązań musi zacząć od wyczyszczenia starych linków,
 	// inaczej planner może pracować na nieaktualnych TowarID z poprzednich przebiegów.
@@ -223,7 +235,11 @@ func (i *Importer) LinkProductsByEAN() error {
 		Int("dbg_matched_printed", dbgMatchedCount).
 		Msg("EAN linking finished")
 
-	return tx.Commit().Error
+	if err := tx.Commit().Error; err != nil {
+		return err
+	}
+	committed = true
+	return nil
 }
 
 // saveLinkIssue – zapisuje pojedynczy problem w linkowaniu

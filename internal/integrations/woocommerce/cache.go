@@ -73,15 +73,15 @@ func (w *Woo) primeCache(ctx context.Context, gdb *gorm.DB) error {
 
 		for _, p := range items {
 			rows = append(rows, db.WooProductCache{
-				WooID:        uint(p.ID),
-				TowarID:      nil, // nie znamy jeszcze mapowania z PCM – zostanie uzupełnione później
-				Kod:          p.SKU,
-				Ean:          p.cacheEAN(),
-				Name:         p.Name,
-				PriceRegular: parsePrice(p.RegularPrice),
-				PriceSale:    parsePrice(p.SalePrice),
-				HurtPrice:    parsePrice(w.customFieldValue(p, "hurt_price")),
-				StockQty:     p.StockQuantity,
+				WooID:             uint(p.ID),
+				TowarID:           nil, // nie znamy jeszcze mapowania z PCM – zostanie uzupełnione później
+				Kod:               p.SKU,
+				Ean:               p.cacheEAN(),
+				Name:              p.Name,
+				PriceRegular:      parsePrice(p.RegularPrice),
+				PriceSale:         parsePrice(p.SalePrice),
+				HurtPrice:         parsePrice(w.customFieldValue(p, "hurt_price")),
+				StockQty:          p.StockQuantity,
 				StockManaged:      p.ManageStock,
 				StockStatus:       p.StockStatus,
 				Backorders:        p.Backorders,
@@ -216,22 +216,22 @@ func (w *Woo) sweepOnce(ctx context.Context, gdb *gorm.DB) {
 			}
 
 			rows = append(rows, db.WooProductCache{
-				WooID:        uint(p.ID),
-				TowarID:      nil,
-				Kod:          p.SKU,
-				Ean:          p.cacheEAN(),
-				Name:         p.Name,
-				PriceRegular: parsePrice(p.RegularPrice),
-				PriceSale:    parsePrice(p.SalePrice),
-				HurtPrice:    parsePrice(w.customFieldValue(p, "hurt_price")),
-				StockQty:     p.StockQuantity,
+				WooID:             uint(p.ID),
+				TowarID:           nil,
+				Kod:               p.SKU,
+				Ean:               p.cacheEAN(),
+				Name:              p.Name,
+				PriceRegular:      parsePrice(p.RegularPrice),
+				PriceSale:         parsePrice(p.SalePrice),
+				HurtPrice:         parsePrice(w.customFieldValue(p, "hurt_price")),
+				StockQty:          p.StockQuantity,
 				StockManaged:      p.ManageStock,
 				StockStatus:       p.StockStatus,
 				Backorders:        p.Backorders,
 				CatalogVisibility: p.CatalogVisibility,
-				Status:       p.Status,
-				Type:         p.Type,
-				DateModified: p.DateModifiedGMT,
+				Status:            p.Status,
+				Type:              p.Type,
+				DateModified:      p.DateModifiedGMT,
 			})
 		}
 
@@ -278,7 +278,11 @@ func parsePrice(s string) float64 {
 
 func kvGetTime(gdb *gorm.DB, key string) (time.Time, bool) {
 	var row db.KV
-	if err := gdb.Where("k = ?", key).Take(&row).Error; err != nil {
+	res := gdb.Where("k = ?", key).Limit(1).Find(&row)
+	if res.Error != nil {
+		return time.Time{}, false
+	}
+	if res.RowsAffected == 0 {
 		return time.Time{}, false
 	}
 	t, err := time.Parse(time.RFC3339, row.V)

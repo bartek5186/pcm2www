@@ -30,16 +30,16 @@ type plannerSourceRow struct {
 }
 
 type plannerCacheRow struct {
-	WooID        uint
-	TowarID      *int64
-	Kod          string
-	Ean          string
-	Name         string
-	PriceRegular float64
-	PriceSale    float64
-	HurtPrice    float64
-	TaxClass     string
-	StockQty     float64
+	WooID             uint
+	TowarID           *int64
+	Kod               string
+	Ean               string
+	Name              string
+	PriceRegular      float64
+	PriceSale         float64
+	HurtPrice         float64
+	TaxClass          string
+	StockQty          float64
 	StockManaged      bool
 	StockStatus       string
 	Backorders        string
@@ -47,25 +47,25 @@ type plannerCacheRow struct {
 }
 
 type plannerStats struct {
-	ImportID                    uint
-	Filename                    string
-	ProductsSeen                int
-	LinkedProducts              int
-	UnlinkedProducts            int
-	AmbiguousProducts           int
-	EANTasksCreated             int
-	EANTasksRequeued            int
-	StockTasksCreated           int
-	StockTasksRequeued          int
-	PriceTasksCreated           int
-	PriceTasksRequeued          int
-	AvailabilityTasksCreated    int
-	AvailabilityTasksRequeued   int
-	ExistingPendingOrDone       int
-	PolicySkipEANPresent        int
-	PolicySkipDuplicateEAN      int
-	PolicySkipStockUnmanaged    int
-	PolicySkipPriceSale         int
+	ImportID                  uint
+	Filename                  string
+	ProductsSeen              int
+	LinkedProducts            int
+	UnlinkedProducts          int
+	AmbiguousProducts         int
+	EANTasksCreated           int
+	EANTasksRequeued          int
+	StockTasksCreated         int
+	StockTasksRequeued        int
+	PriceTasksCreated         int
+	PriceTasksRequeued        int
+	AvailabilityTasksCreated  int
+	AvailabilityTasksRequeued int
+	ExistingPendingOrDone     int
+	PolicySkipEANPresent      int
+	PolicySkipDuplicateEAN    int
+	PolicySkipStockUnmanaged  int
+	PolicySkipPriceSale       int
 }
 
 func (i *Importer) PlanWooTasksForImports(importIDs []uint) error {
@@ -113,7 +113,12 @@ func (i *Importer) PlanWooTasksForRecentImports(window time.Duration) error {
 
 func (i *Importer) PlanWooTasks(importID uint) error {
 	tx := i.db.Begin()
-	defer tx.Rollback()
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback().Error
+		}
+	}()
 
 	stats, err := i.planWooTasksTx(tx, importID)
 	if err != nil {
@@ -123,6 +128,7 @@ func (i *Importer) PlanWooTasks(importID uint) error {
 	if err := tx.Commit().Error; err != nil {
 		return err
 	}
+	committed = true
 
 	i.log.Info().
 		Uint("import_id", stats.ImportID).

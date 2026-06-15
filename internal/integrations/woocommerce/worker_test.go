@@ -257,20 +257,20 @@ func TestExecuteWooTaskRequeuesInterruptedRequest(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	payload, _ := json.Marshal(db.WooStockUpdatePayload{ImportID: importID, WooID: wooID, TowarID: towarID, DesiredStock: 4})
+	payload, _ := json.Marshal(db.WooEANUpdatePayload{ImportID: importID, WooID: wooID, TowarID: towarID, DesiredEAN: "5901234567890"})
 	if err := gdb.Create(&db.WooTask{
-		TaskKey:     "stock.update:10:4",
+		TaskKey:     "ean.update:10:5901234567890",
 		ImportID:    importID,
 		TowarID:     &towarID,
 		WooID:       &wooID,
-		Kind:        db.WooTaskKindStockUpdate,
+		Kind:        db.WooTaskKindEANUpdate,
 		PayloadJSON: string(payload),
 		Status:      "pending",
 	}).Error; err != nil {
 		t.Fatal(err)
 	}
 
-	task, err := claimNextWooTask(gdb)
+	task, err := claimNextSequentialWooTask(gdb)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -341,6 +341,37 @@ func newWooWorkerTestClient(t *testing.T, state map[uint]wcProduct) *http.Client
 	return &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
 		path := strings.TrimPrefix(r.URL.Path, "/wp-json/wc/v3/products")
 		path = strings.Trim(path, "/")
+		if path == "batch" {
+			if r.Method != http.MethodPost {
+				return textResponse(http.StatusMethodNotAllowed, "method not allowed"), nil
+			}
+
+			var body struct {
+				Update []map[string]any `json:"update"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				return textResponse(http.StatusBadRequest, "bad json"), nil
+			}
+
+			updated := make([]wcProduct, 0, len(body.Update))
+			for _, item := range body.Update {
+				id64, ok := toUint64(item["id"])
+				if !ok {
+					return textResponse(http.StatusBadRequest, "bad id"), nil
+				}
+				id := uint(id64)
+				product, exists := state[id]
+				if !exists {
+					return textResponse(http.StatusNotFound, "not found"), nil
+				}
+				applyProductUpdate(&product, item)
+				state[id] = product
+				updated = append(updated, product)
+			}
+
+			return jsonResponse(http.StatusOK, map[string]any{"update": updated})
+		}
+
 		if path == "" {
 			var products []wcProduct
 			for _, product := range state {
@@ -368,27 +399,7 @@ func newWooWorkerTestClient(t *testing.T, state map[uint]wcProduct) *http.Client
 			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 				return textResponse(http.StatusBadRequest, "bad json"), nil
 			}
-			if raw, ok := body["global_unique_id"]; ok {
-				product.GlobalUniqueID = fmt.Sprint(raw)
-			}
-			if raw, ok := body["stock_quantity"]; ok {
-				switch v := raw.(type) {
-				case float64:
-					product.StockQuantity = v
-				case string:
-					f, _ := strconv.ParseFloat(v, 64)
-					product.StockQuantity = f
-				}
-			}
-			if raw, ok := body["regular_price"]; ok {
-				product.RegularPrice = fmt.Sprint(raw)
-			}
-			if raw, ok := body["hurt_price"]; ok {
-				_ = raw // top-level hurt_price is ignored by the live store
-			}
-			if raw, ok := body["meta_data"]; ok {
-				applyMetaDataUpdate(&product, raw)
-			}
+			applyProductUpdate(&product, body)
 			state[id] = product
 			return jsonResponse(http.StatusOK, product)
 
@@ -460,5 +471,66 @@ func applyMetaDataUpdate(product *wcProduct, raw any) {
 		if key == "_hurt_price" {
 			product.HurtPrice = value
 		}
+	}
+}
+
+func applyProductUpdate(product *wcProduct, body map[string]any) {
+	if raw, ok := body["global_unique_id"]; ok {
+		product.GlobalUniqueID = fmt.Sprint(raw)
+	}
+	if raw, ok := body["stock_quantity"]; ok {
+		switch v := raw.(type) {
+		case float64:
+			product.StockQuantity = v
+		case string:
+			f, _ := strconv.ParseFloat(v, 64)
+			product.StockQuantity = f
+		}
+	}
+	if raw, ok := body["regular_price"]; ok {
+		product.RegularPrice = fmt.Sprint(raw)
+	}
+	if raw, ok := body["hurt_price"]; ok {
+		_ = raw // top-level hurt_price is ignored by the live store
+	}
+	if raw, ok := body["tax_class"]; ok {
+		product.TaxClass = fmt.Sprint(raw)
+	}
+	if raw, ok := body["manage_stock"]; ok {
+		if b, ok := raw.(bool); ok {
+			product.ManageStock = b
+		}
+	}
+	if raw, ok := body["stock_status"]; ok {
+		product.StockStatus = fmt.Sprint(raw)
+	}
+	if raw, ok := body["backorders"]; ok {
+		product.Backorders = fmt.Sprint(raw)
+	}
+	if raw, ok := body["catalog_visibility"]; ok {
+		product.CatalogVisibility = fmt.Sprint(raw)
+	}
+	if raw, ok := body["meta_data"]; ok {
+		applyMetaDataUpdate(product, raw)
+	}
+}
+
+func toUint64(v any) (uint64, bool) {
+	switch x := v.(type) {
+	case float64:
+		return uint64(x), true
+	case int:
+		return uint64(x), true
+	case int64:
+		return uint64(x), true
+	case uint:
+		return uint64(x), true
+	case uint64:
+		return x, true
+	case string:
+		n, err := strconv.ParseUint(x, 10, 64)
+		return n, err == nil
+	default:
+		return 0, false
 	}
 }
