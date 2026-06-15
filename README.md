@@ -55,7 +55,8 @@ Plik konfiguracyjny: `~/.config/pcm2www/config.json`
     },
     "importer": {
       "watch_dir": "~/pcm2www/imports",
-      "poll_sec": 5
+      "poll_sec": 5,
+      "price_mode": "gross"
     }
   },
   "auto_start": true,
@@ -68,6 +69,11 @@ Integracja składa się z trzech głównych sekcji:
 - **database** – wybór silnika bazy danych (`sqlite` / `postgres` / `mysql`)
 - **integrations.woocommerce** – ustawienia połączenia z WooCommerce
 - **integrations.importer** – ustawienia importu plików z PC-Market
+
+`integrations.importer.price_mode` określa, jaką cenę planner wysyła do WooCommerce:
+
+- `"gross"` – domyślnie; wysyła ceny brutto z PC-Market bez przeliczania.
+- `"net"` – przelicza ceny brutto z PC-Market na netto według `vat_id`.
 - **auto_start, sync_interval_seconds** – parametry globalne
 
 ## Baza danych
@@ -155,6 +161,8 @@ Worker działa w tle i przetwarza kolejkę zadań atomicznie (claim → execute 
 | `stock.update` | Aktualizacja stanu magazynowego | Skip jeśli `cena_detal=0`; skip jeśli `manage_stock=false`; skip jeśli stan już się zgadza; skip jeśli PCM nie zmienił stanu od poprzedniego importu |
 | `price.update` | Aktualizacja ceny regularnej, hurtowej i klasy podatkowej (`tax_class`) | Skip jeśli `cena_detal=0`; skip jeśli aktywna `sale_price > 0`; skip jeśli cena i klasa podatkowa już się zgadzają |
 | `availability.update` | Zarządzanie dostępnością produktu w sklepie | Skip jeśli stan w Woo już jest zgodny z oczekiwanym |
+
+`price.update` używa `integrations.importer.price_mode`: domyślne `"gross"` wysyła ceny brutto z PC-Market, a `"net"` przelicza je na netto przed utworzeniem taska.
 
 **Logika dostępności (cena_detal z PCM):**
 

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"strconv"
 	"strings"
 	"testing"
@@ -206,6 +207,106 @@ func TestWorkerTickAppliesSafetyPolicy(t *testing.T) {
 		if want[row.Kind] != row.Status {
 			t.Fatalf("unexpected status for %s: got %s want %s", row.Kind, row.Status, want[row.Kind])
 		}
+	}
+}
+
+func TestWorkerTickMarksBatchPostFailureAsError(t *testing.T) {
+	gdb := newWooWorkerTestDB(t)
+	importID := uint(5)
+	towarID := int64(501)
+	wooID := uint(50)
+
+	if err := gdb.Create(&db.ImportFile{ImportID: importID, Filename: "exp_wyk_batch_failure.xml", Status: 1}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := gdb.Create(&db.WooProductCache{
+		WooID:        wooID,
+		TowarID:      &towarID,
+		Kod:          "SKU-50",
+		Name:         "Batch Failure Product",
+		PriceRegular: 20,
+		HurtPrice:    10,
+		StockManaged: true,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	payload, _ := json.Marshal(db.WooPriceUpdatePayload{
+		ImportID:       importID,
+		WooID:          wooID,
+		TowarID:        towarID,
+		SKU:            "SKU-50",
+		ProductName:    "Batch Failure Product",
+		DesiredRegular: 25,
+		DesiredHurt:    17,
+	})
+	if err := gdb.Create(&db.WooTask{
+		TaskKey:     "price.update:50:25:17",
+		ImportID:    importID,
+		TowarID:     &towarID,
+		WooID:       &wooID,
+		Kind:        db.WooTaskKindPriceUpdate,
+		PayloadJSON: string(payload),
+		Status:      "pending",
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/wp-json/wc/v3/products":
+			_ = json.NewEncoder(w).Encode([]wcProduct{{
+				ID:            int64(wooID),
+				Name:          "Batch Failure Product",
+				SKU:           "SKU-50",
+				RegularPrice:  "20",
+				SalePrice:     "0",
+				MetaData:      []wcMetaData{{Key: "_hurt_price", Value: "10"}},
+				ManageStock:   true,
+				StockQuantity: 4,
+				Status:        "publish",
+				Type:          "simple",
+			}})
+		case r.Method == http.MethodPost && r.URL.Path == "/wp-json/wc/v3/products/batch":
+			http.Error(w, `{"code":"woocommerce_rest_cannot_update","message":"forced failure"}`, http.StatusInternalServerError)
+		default:
+			http.NotFound(w, r)
+		}
+	})
+	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, r)
+		return rec.Result(), nil
+	})}
+
+	w := &Woo{
+		log:  zerolog.Nop(),
+		cfg:  Config{BaseURL: "https://woo.test", ConsumerKey: "ck", ConsumerSec: "cs"},
+		http: client,
+	}
+
+	w.workerTick(context.Background(), gdb)
+
+	var task db.WooTask
+	if err := gdb.Where("task_key = ?", "price.update:50:25:17").Take(&task).Error; err != nil {
+		t.Fatal(err)
+	}
+	if task.Status != "error" {
+		t.Fatalf("expected batch POST failure to mark task error, got %+v", task)
+	}
+	if !strings.Contains(task.LastError, "batch POST") || !strings.Contains(task.LastError, "http 500") {
+		t.Fatalf("expected last_error to mention batch POST http 500, got %q", task.LastError)
+	}
+	if task.Attempts != 1 {
+		t.Fatalf("expected one attempt, got %+v", task)
+	}
+
+	var cache db.WooProductCache
+	if err := gdb.Where("woo_id = ?", wooID).Take(&cache).Error; err != nil {
+		t.Fatal(err)
+	}
+	if cache.PriceRegular != 20 || cache.HurtPrice != 10 {
+		t.Fatalf("cache should not pretend failed price update succeeded: %+v", cache)
 	}
 }
 

@@ -160,6 +160,67 @@ func TestPlanWooTasksCreatesEANStockAndPriceTasks(t *testing.T) {
 	}
 }
 
+func TestPlanWooTasksCanSendNetPrices(t *testing.T) {
+	gdb := newImporterTestDB(t)
+	importer := &Importer{log: zerolog.Nop(), db: gdb, cfg: Config{PriceMode: priceModeNet}}
+
+	const importID = 8
+	towarID := int64(110)
+	wooID := uint(210)
+
+	if err := gdb.Create(&db.ImportFile{ImportID: importID, Filename: "exp_wyk_net_prices.xml", Status: 1}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := gdb.Create(&db.StProduct{
+		ImportID:    importID,
+		TowarID:     towarID,
+		Kod:         "5901234567891",
+		Nazwa:       "Net Price Product",
+		VatID:       2300,
+		CenaDetal:   123,
+		CenaHurtowa: 61.5,
+		AktywnyWSI:  true,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := gdb.Create(&db.WooProductCache{
+		WooID:        wooID,
+		TowarID:      &towarID,
+		Kod:          "SKU-NET",
+		Ean:          "5901234567891",
+		Name:         "Net Price Product",
+		PriceRegular: 123,
+		PriceSale:    0,
+		HurtPrice:    61.5,
+		StockManaged: true,
+		Backorders:   "notify",
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	if err := importer.PlanWooTasks(importID); err != nil {
+		t.Fatal(err)
+	}
+
+	var task db.WooTask
+	if err := gdb.Where("kind = ?", db.WooTaskKindPriceUpdate).Take(&task).Error; err != nil {
+		t.Fatal(err)
+	}
+	var pricePayload db.WooPriceUpdatePayload
+	if err := json.Unmarshal([]byte(task.PayloadJSON), &pricePayload); err != nil {
+		t.Fatal(err)
+	}
+	if pricePayload.DesiredRegular != 100 {
+		t.Fatalf("expected net regular price 100, got %v", pricePayload.DesiredRegular)
+	}
+	if pricePayload.DesiredHurt != 50 {
+		t.Fatalf("expected net hurt price 50, got %v", pricePayload.DesiredHurt)
+	}
+	if pricePayload.DesiredTaxClass != "2300" {
+		t.Fatalf("expected tax class 2300, got %q", pricePayload.DesiredTaxClass)
+	}
+}
+
 func TestPlanWooTasksAppliesSafetyPolicy(t *testing.T) {
 	gdb := newImporterTestDB(t)
 	importer := &Importer{log: zerolog.Nop(), db: gdb}

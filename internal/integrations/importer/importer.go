@@ -24,8 +24,9 @@ import (
 )
 
 type Config struct {
-	WatchDir string `json:"watch_dir"` // np. ~/pcm2www/imports
-	PollSec  int    `json:"poll_sec"`  // np. 5-10s w dev
+	WatchDir  string `json:"watch_dir"`            // np. ~/pcm2www/imports
+	PollSec   int    `json:"poll_sec"`             // np. 5-10s w dev
+	PriceMode string `json:"price_mode,omitempty"` // gross (domyślnie) albo net
 }
 
 type Importer struct {
@@ -502,6 +503,11 @@ func factory(log zerolog.Logger, raw json.RawMessage) (integrations.Integration,
 	if err := json.Unmarshal(raw, &cfg); err != nil {
 		return nil, err
 	}
+	mode, err := normalizePriceMode(cfg.PriceMode)
+	if err != nil {
+		return nil, err
+	}
+	cfg.PriceMode = mode
 	return &Importer{log: log, cfg: cfg}, nil
 }
 

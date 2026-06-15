@@ -18,7 +18,8 @@
     },
     "importer": {
       "watch_dir": "~/pcm2www/imports",
-      "poll_sec": 5
+      "poll_sec": 5,
+      "price_mode": "gross"
     }
   },
   "auto_start": true,

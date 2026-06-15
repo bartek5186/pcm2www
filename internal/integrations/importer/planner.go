@@ -14,6 +14,11 @@ import (
 	"gorm.io/gorm"
 )
 
+const (
+	priceModeGross = "gross"
+	priceModeNet   = "net"
+)
+
 type plannerSourceRow struct {
 	ImportID       uint
 	TowarID        int64
@@ -493,12 +498,52 @@ func vatIDToTaxClass(vatID int64) string {
 	}
 }
 
+func vatIDToRate(vatID int64) float64 {
+	switch vatID {
+	case 2300:
+		return 0.23
+	case 800:
+		return 0.08
+	case 500:
+		return 0.05
+	case 0, -1:
+		return 0
+	default:
+		return 0.23
+	}
+}
+
+func normalizePriceMode(mode string) (string, error) {
+	mode = strings.TrimSpace(strings.ToLower(mode))
+	if mode == "" {
+		return priceModeGross, nil
+	}
+	switch mode {
+	case priceModeGross, priceModeNet:
+		return mode, nil
+	default:
+		return "", fmt.Errorf("unsupported importer price_mode %q (allowed: %s, %s)", mode, priceModeGross, priceModeNet)
+	}
+}
+
+func (i *Importer) wooPriceFromGross(gross float64, vatID int64) float64 {
+	mode, err := normalizePriceMode(i.cfg.PriceMode)
+	if err != nil || mode == priceModeGross {
+		return gross
+	}
+	rate := vatIDToRate(vatID)
+	if rate == 0 {
+		return gross
+	}
+	return math.Round((gross/(1+rate))*100) / 100
+}
+
 func (i *Importer) planPriceUpdateTask(tx *gorm.DB, importID uint, src plannerSourceRow, cache plannerCacheRow) (created, requeued, existed, skipped bool, err error) {
 	if floatAlmostEqual(src.CenaDetal, 0) {
 		return false, false, false, false, nil // produkt niedostępny (brak ceny) — nie ustawiaj ceny 0
 	}
-	desiredRegular := src.CenaDetal
-	desiredHurt := src.CenaHurtowa
+	desiredRegular := i.wooPriceFromGross(src.CenaDetal, src.VatID)
+	desiredHurt := i.wooPriceFromGross(src.CenaHurtowa, src.VatID)
 	desiredTaxClass := vatIDToTaxClass(src.VatID)
 	if floatAlmostEqual(cache.PriceRegular, desiredRegular) && floatAlmostEqual(cache.HurtPrice, desiredHurt) && cache.TaxClass == desiredTaxClass {
 		return false, false, false, false, nil
