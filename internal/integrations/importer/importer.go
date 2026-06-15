@@ -174,6 +174,11 @@ func (i *Importer) scanOnce(dir string) {
 					// leć dalej do processFile
 				} else {
 					//i.log.Debug().Str("file", name).Msg("plik już był i DONE — pomijam")
+					if archivedPath, err := archiveProcessedFile(dir, full, name, importID); err != nil {
+						i.log.Error().Err(err).Str("file", name).Msg("archiwizacja już przetworzonego pliku nieudana")
+					} else {
+						i.log.Info().Str("file", name).Str("archived_path", archivedPath).Msg("przeniesiono już przetworzony plik do parsed")
+					}
 					continue
 				}
 			} else {
@@ -194,7 +199,12 @@ func (i *Importer) scanOnce(dir string) {
 		_ = i.db.Model(&db.ImportFile{}).Where("import_id = ?", importID).
 			Updates(map[string]any{"status": 1, "processed_at": now})
 
-		i.log.Info().Str("file", name).Uint("import_id", importID).Msg("przetworzono OK")
+		archivedPath, archiveErr := archiveProcessedFile(dir, full, name, importID)
+		if archiveErr != nil {
+			i.log.Error().Err(archiveErr).Str("file", name).Uint("import_id", importID).Msg("archiwizacja przetworzonego pliku nieudana")
+		}
+
+		i.log.Info().Str("file", name).Str("archived_path", archivedPath).Uint("import_id", importID).Msg("przetworzono OK")
 		processed = true
 		processedImportIDs = append(processedImportIDs, importID)
 	}
@@ -209,6 +219,35 @@ func (i *Importer) scanOnce(dir string) {
 		}
 	}
 
+}
+
+func archiveProcessedFile(dir, fullPath, name string, importID uint) (string, error) {
+	parsedDir := filepath.Join(dir, "parsed")
+	if err := os.MkdirAll(parsedDir, 0o755); err != nil {
+		return "", err
+	}
+
+	dest := filepath.Join(parsedDir, name)
+	if _, err := os.Stat(dest); err == nil {
+		ext := filepath.Ext(name)
+		base := strings.TrimSuffix(name, ext)
+		dest = filepath.Join(parsedDir, base+".import_"+strconv.FormatUint(uint64(importID), 10)+ext)
+		for n := 1; ; n++ {
+			if _, err := os.Stat(dest); os.IsNotExist(err) {
+				break
+			} else if err != nil {
+				return "", err
+			}
+			dest = filepath.Join(parsedDir, base+".import_"+strconv.FormatUint(uint64(importID), 10)+"."+strconv.Itoa(n)+ext)
+		}
+	} else if err != nil && !os.IsNotExist(err) {
+		return "", err
+	}
+
+	if err := os.Rename(fullPath, dest); err != nil {
+		return "", err
+	}
+	return dest, nil
 }
 
 func (i *Importer) registerFile(fullPath, name string) (uint, bool, error) {

@@ -109,6 +109,7 @@ func TestImportRealXMLSequenceIntoIsolatedDB(t *testing.T) {
 		if importFile.Status != 1 {
 			t.Fatalf("%s should be imported successfully, got status=%d error=%q", name, importFile.Status, importFile.LastError)
 		}
+		assertArchivedXML(t, watchDir, name)
 
 		applyExpectedImport(&expected, importFile.ImportID, expectedProducts, expectedStocks)
 		after := snapshotImportDB(t, gdb, importFile.ImportID)
@@ -173,7 +174,7 @@ func TestImportRealXMLSequenceIntoIsolatedDB(t *testing.T) {
 	assertNoDuplicateImportRows(t, gdb)
 
 	lastName := filepath.Base(files[len(files)-1])
-	lastID, already, err := imp.registerFile(filepath.Join(watchDir, lastName), lastName)
+	lastID, already, err := imp.registerFile(filepath.Join(watchDir, "parsed", lastName), lastName)
 	if err != nil {
 		t.Fatalf("re-register %s: %v", lastName, err)
 	}
@@ -199,6 +200,7 @@ func TestImportBrokenXMLDoesNotLeavePartialStagingRows(t *testing.T) {
 	}
 
 	imp.scanOnce(watchDir)
+	assertFileExists(t, brokenPath)
 
 	brokenImport := mustImportFile(t, gdb, brokenName)
 	if brokenImport.Status != 2 {
@@ -224,10 +226,23 @@ func TestImportBrokenXMLDoesNotLeavePartialStagingRows(t *testing.T) {
 	if goodImport.Status != 1 {
 		t.Fatalf("valid XML after broken file should import successfully, got status=%d error=%q", goodImport.Status, goodImport.LastError)
 	}
+	assertArchivedXML(t, watchDir, goodName)
 	mustCount(t, gdb.Model(&db.StProduct{}), &products)
 	mustCount(t, gdb.Model(&db.StStock{}), &stocks)
 	if products == 0 || stocks == 0 {
 		t.Fatalf("valid XML after broken file did not seed staging: products=%d stocks=%d", products, stocks)
+	}
+
+	copyTestFile(t, fixture, filepath.Join(watchDir, goodName))
+	imp.scanOnce(watchDir)
+	assertFileMissing(t, filepath.Join(watchDir, goodName))
+
+	duplicateArchived, err := filepath.Glob(filepath.Join(watchDir, "parsed", strings.TrimSuffix(goodName, filepath.Ext(goodName))+".import_*"+filepath.Ext(goodName)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(duplicateArchived) == 0 {
+		t.Fatalf("expected duplicate DONE XML to be archived with import suffix")
 	}
 }
 
@@ -502,6 +517,28 @@ func copyTestFile(t *testing.T, sourcePath, destPath string) {
 	}
 	if err := os.WriteFile(destPath, raw, 0o600); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func assertArchivedXML(t *testing.T, watchDir, name string) {
+	t.Helper()
+	assertFileMissing(t, filepath.Join(watchDir, name))
+	assertFileExists(t, filepath.Join(watchDir, "parsed", name))
+}
+
+func assertFileExists(t *testing.T, path string) {
+	t.Helper()
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("expected file %s to exist: %v", path, err)
+	}
+}
+
+func assertFileMissing(t *testing.T, path string) {
+	t.Helper()
+	if _, err := os.Stat(path); err == nil {
+		t.Fatalf("expected file %s to be moved away", path)
+	} else if !os.IsNotExist(err) {
+		t.Fatalf("stat %s: %v", path, err)
 	}
 }
 
