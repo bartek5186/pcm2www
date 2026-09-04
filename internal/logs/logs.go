@@ -80,6 +80,17 @@ func (w *rotatingFileWriter) Write(p []byte) (int, error) {
 	return w.file.Write(p)
 }
 
+func (w *rotatingFileWriter) Close() error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.file == nil {
+		return nil
+	}
+	err := w.file.Close()
+	w.file = nil
+	return err
+}
+
 func (w *rotatingFileWriter) rotate() error {
 	if err := w.file.Close(); err != nil {
 		return err

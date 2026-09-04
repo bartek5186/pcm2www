@@ -12,6 +12,11 @@ func TestRotatingFileWriterKeepsBoundedBackups(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() {
+		if err := w.Close(); err != nil {
+			t.Errorf("close rotating log writer: %v", err)
+		}
+	})
 	for range 5 {
 		if _, err := w.Write([]byte("12345678")); err != nil {
 			t.Fatal(err)

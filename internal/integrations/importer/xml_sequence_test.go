@@ -220,9 +220,15 @@ func TestImportBrokenXMLDoesNotLeavePartialStagingRows(t *testing.T) {
 		t.Fatalf("broken XML left partial staging rows: products=%d stocks=%d", products, stocks)
 	}
 
-	fixture := firstRealXMLFixtureFile(t)
-	goodName := filepath.Base(fixture)
-	copyTestFile(t, fixture, filepath.Join(watchDir, goodName))
+	goodName := "exp_wyk_valid_after_broken.xml"
+	goodXML := []byte(`<?xml version="1.0" encoding="UTF-8"?>
+<root><transmisja_id>valid-after-broken-1</transmisja_id><towary><towar>
+<towar_id>2</towar_id><kod>5901234567890</kod><nazwa>Valid product</nazwa><cena_detal>12.34</cena_detal>
+<magazyny><magazyn><magazyn_id>1</magazyn_id><stan_magazynu>3</stan_magazynu></magazyn></magazyny>
+</towar></towary></root>`)
+	if err := os.WriteFile(filepath.Join(watchDir, goodName), goodXML, 0o600); err != nil {
+		t.Fatal(err)
+	}
 	imp.scanOnce(watchDir)
 
 	goodImport := mustImportFile(t, gdb, goodName)
@@ -236,7 +242,9 @@ func TestImportBrokenXMLDoesNotLeavePartialStagingRows(t *testing.T) {
 		t.Fatalf("valid XML after broken file did not seed staging: products=%d stocks=%d", products, stocks)
 	}
 
-	copyTestFile(t, fixture, filepath.Join(watchDir, goodName))
+	if err := os.WriteFile(filepath.Join(watchDir, goodName), goodXML, 0o600); err != nil {
+		t.Fatal(err)
+	}
 	imp.scanOnce(watchDir)
 	assertFileMissing(t, filepath.Join(watchDir, goodName))
 
@@ -577,15 +585,6 @@ func realXMLFixtureFiles(t *testing.T) []string {
 		}
 	}
 	return nil
-}
-
-func firstRealXMLFixtureFile(t *testing.T) string {
-	t.Helper()
-	files := realXMLFixtureFiles(t)
-	if len(files) == 0 {
-		t.Fatalf("expected at least one XML fixture file")
-	}
-	return files[0]
 }
 
 func parseExpectedXMLFile(t *testing.T, path string) ([]expectedProduct, []expectedStock) {

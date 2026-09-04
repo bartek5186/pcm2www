@@ -40,6 +40,7 @@ func TestMigrateBacksUpSQLiteAndDeduplicatesLegacyProductIdentity(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
+	closeMigrationTestDB(t, h.DB)
 	if err := h.DB.Exec(`CREATE TABLE st_products (
 		id integer PRIMARY KEY AUTOINCREMENT,
 		towar_id integer NOT NULL,
@@ -137,5 +138,19 @@ func newMigrationTestHandle(t *testing.T) *Handle {
 	if err != nil {
 		t.Fatal(err)
 	}
+	closeMigrationTestDB(t, gdb)
 	return &Handle{DB: gdb, Driver: "sqlite"}
+}
+
+func closeMigrationTestDB(t *testing.T, gdb *gorm.DB) {
+	t.Helper()
+	sqlDB, err := gdb.DB()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := sqlDB.Close(); err != nil {
+			t.Errorf("close migration test DB: %v", err)
+		}
+	})
 }
