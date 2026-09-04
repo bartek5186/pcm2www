@@ -2,6 +2,7 @@ package importer
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"encoding/xml"
 	"io"
@@ -9,21 +10,19 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
-	"strconv"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/bartek5186/pcm2www/internal/db"
+	"github.com/bartek5186/pcm2www/internal/integrations"
 	"github.com/rs/zerolog"
 	"golang.org/x/net/html/charset"
 	"gorm.io/gorm"
 )
 
 const (
-	realXMLFixtureEnv      = "PCM2WWW_IMPORT_XML_FIXTURE_TESTS"
-	xmlCheckpointEveryEnv  = "PCM2WWW_IMPORT_XML_CHECKPOINT_EVERY"
-	defaultCheckpointEvery = 10
+	realXMLFixtureEnv = "PCM2WWW_IMPORT_XML_FIXTURE_TESTS"
 )
 
 type importSnapshot struct {
@@ -36,26 +35,32 @@ type importSnapshot struct {
 	ChangedCurrentStocks int64
 }
 
-type productKey struct {
-	TowarID int64
-	Kod     string
-}
-
 type stockKey struct {
 	TowarID   int64
 	MagazynID int64
 }
 
 type expectedProduct struct {
-	ImportID    uint
-	TowarID     int64
-	Kod         string
-	Nazwa       string
-	VatID       int64
-	CenaDetal   float64
-	CenaHurtowa float64
-	AktywnyWSI  bool
-	DoUsuniecia bool
+	ImportID         uint
+	TowarID          int64
+	Kod              string
+	Nazwa            string
+	Opis1            string
+	VatID            int64
+	KategoriaID      int64
+	GrupaID          int64
+	JmID             int64
+	CenaDetal        float64
+	CenaHurtowa      float64
+	CenaNocna        float64
+	CenaDodatkowa    float64
+	CenaDetPrzedProm float64
+	NajCena30Det     float64
+	AktywnyWSI       bool
+	DoUsuniecia      bool
+	DataAktualizacji string
+	FolderZdjec      string
+	PlikZdjecia      string
 }
 
 type expectedStock struct {
@@ -68,7 +73,7 @@ type expectedStock struct {
 }
 
 type expectedImportState struct {
-	Products map[productKey]expectedProduct
+	Products map[int64]expectedProduct
 	Stocks   map[stockKey]expectedStock
 }
 
@@ -86,11 +91,9 @@ func TestImportRealXMLSequenceIntoIsolatedDB(t *testing.T) {
 	watchDir := t.TempDir()
 	imp := &Importer{log: zerolog.Nop(), db: gdb}
 	expected := expectedImportState{
-		Products: make(map[productKey]expectedProduct),
+		Products: make(map[int64]expectedProduct),
 		Stocks:   make(map[stockKey]expectedStock),
 	}
-	checkpointEvery := xmlCheckpointEvery(t)
-
 	var first, final importSnapshot
 	totalChangedStockRows := int64(0)
 	grossPricePlanned := false
@@ -113,11 +116,11 @@ func TestImportRealXMLSequenceIntoIsolatedDB(t *testing.T) {
 
 		applyExpectedImport(&expected, importFile.ImportID, expectedProducts, expectedStocks)
 		after := snapshotImportDB(t, gdb, importFile.ImportID)
-		if after.CurrentProducts == 0 {
-			t.Fatalf("%s imported no product rows", name)
+		if after.CurrentProducts != int64(len(expectedProducts)) {
+			t.Fatalf("%s current product rows got=%d want=%d", name, after.CurrentProducts, len(expectedProducts))
 		}
-		if after.CurrentStocks == 0 {
-			t.Fatalf("%s imported no stock rows", name)
+		if after.CurrentStocks != int64(len(expectedStocks)) {
+			t.Fatalf("%s current stock rows got=%d want=%d", name, after.CurrentStocks, len(expectedStocks))
 		}
 		if after.Products < before.Products {
 			t.Fatalf("%s reduced product row count from %d to %d", name, before.Products, after.Products)
@@ -136,9 +139,9 @@ func TestImportRealXMLSequenceIntoIsolatedDB(t *testing.T) {
 			grossPricePlanned = assertPlannerUsesGrossStagingPrice(t, gdb, imp, importFile.ImportID)
 		}
 
-		if shouldCheckXMLState(idx, len(files), checkpointEvery) {
-			assertExpectedImportState(t, gdb, expected, idx+1, name)
-		}
+		// Każdy XML jest osobną klatką stanu. Porównanie całej bazy po każdym
+		// kroku wykrywa również błędy przejściowe, które zniknęłyby do końca serii.
+		assertExpectedImportState(t, gdb, expected, idx+1, name)
 
 		t.Logf(
 			"%03d/%03d %s: products=%d(+%d current=%d), stocks=%d(+%d current=%d), stocks_with_prev=%d, changed_current_stocks=%d",
@@ -246,6 +249,287 @@ func TestImportBrokenXMLDoesNotLeavePartialStagingRows(t *testing.T) {
 	}
 }
 
+func TestImportInvalidNumericValueDoesNotDisableProducts(t *testing.T) {
+	gdb := newImporterTestDB(t)
+	watchDir := t.TempDir()
+	imp := &Importer{log: zerolog.Nop(), db: gdb}
+
+	name := "exp_wyk_9999_20260615121000.xml"
+	path := filepath.Join(watchDir, name)
+	raw := `<?xml version="1.0" encoding="UTF-8"?>
+<root><transmisja_id>invalid-number-1</transmisja_id><towary><towar>
+<towar_id>1</towar_id><kod>5901234567890</kod><nazwa>Invalid price</nazwa>
+<cena_detal>not-a-number</cena_detal><cena_hurtowa>10</cena_hurtowa>
+</towar></towary></root>`
+	if err := os.WriteFile(path, []byte(raw), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	imp.scanOnce(watchDir)
+
+	importFile := mustImportFile(t, gdb, name)
+	if importFile.Status != 2 || !strings.Contains(importFile.LastError, "invalid cena_detal") {
+		t.Fatalf("invalid number should fail import explicitly, got status=%d error=%q", importFile.Status, importFile.LastError)
+	}
+	var products int64
+	mustCount(t, gdb.Model(&db.StProduct{}), &products)
+	if products != 0 {
+		t.Fatalf("invalid numeric import left %d staging products", products)
+	}
+}
+
+func TestRegisterFileAllowsReusedFilenameForNewExport(t *testing.T) {
+	gdb := newImporterTestDB(t)
+	imp := &Importer{log: zerolog.Nop(), db: gdb}
+	path := filepath.Join(t.TempDir(), "exp_wyk_current.xml")
+
+	first := `<?xml version="1.0"?><root><transmisja_id>tx-one</transmisja_id></root>`
+	if err := os.WriteFile(path, []byte(first), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	firstID, already, err := imp.registerFile(path, filepath.Base(path))
+	if err != nil || already {
+		t.Fatalf("first registration: id=%d already=%v err=%v", firstID, already, err)
+	}
+
+	second := `<?xml version="1.0"?><root><transmisja_id>tx-two</transmisja_id></root>`
+	if err := os.WriteFile(path, []byte(second), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	secondID, already, err := imp.registerFile(path, filepath.Base(path))
+	if err != nil || already {
+		t.Fatalf("second registration with reused name: id=%d already=%v err=%v", secondID, already, err)
+	}
+	if firstID == secondID {
+		t.Fatalf("different exports with the same filename received one import id: %d", firstID)
+	}
+}
+
+func TestImportEANChangeUpdatesSamePCMProduct(t *testing.T) {
+	gdb := newImporterTestDB(t)
+	watchDir := t.TempDir()
+	imp := &Importer{log: zerolog.Nop(), db: gdb}
+	write := func(name, transmission, ean string) {
+		raw := `<?xml version="1.0"?><root><transmisja_id>` + transmission + `</transmisja_id><towary><towar>` +
+			`<towar_id>44</towar_id><kod>` + ean + `</kod><nazwa>Changed EAN</nazwa>` +
+			`</towar></towary></root>`
+		if err := os.WriteFile(filepath.Join(watchDir, name), []byte(raw), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		imp.scanOnce(watchDir)
+	}
+	write("exp_wyk_ean_1.xml", "ean-change-1", "5900000000044")
+	write("exp_wyk_ean_2.xml", "ean-change-2", "5900000000099")
+
+	var products []db.StProduct
+	if err := gdb.Where("towar_id = ?", 44).Find(&products).Error; err != nil {
+		t.Fatal(err)
+	}
+	if len(products) != 1 || products[0].Kod != "5900000000099" {
+		t.Fatalf("EAN change created a stale PCM row: %+v", products)
+	}
+}
+
+func TestRegisterFileDeduplicatesByNonEmptyTransmissionID(t *testing.T) {
+	gdb := newImporterTestDB(t)
+	imp := &Importer{log: zerolog.Nop(), db: gdb}
+	path := filepath.Join(t.TempDir(), "exp_wyk_transmission.xml")
+
+	first := `<?xml version="1.0"?><root><transmisja_id>same-tx</transmisja_id><value>one</value></root>`
+	if err := os.WriteFile(path, []byte(first), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	firstID, already, err := imp.registerFile(path, filepath.Base(path))
+	if err != nil || already {
+		t.Fatalf("first registration: id=%d already=%v err=%v", firstID, already, err)
+	}
+
+	second := `<?xml version="1.0"?><root><transmisja_id>same-tx</transmisja_id><value>changed</value></root>`
+	if err := os.WriteFile(path, []byte(second), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	secondID, already, err := imp.registerFile(path, filepath.Base(path))
+	if err != nil || !already || secondID != firstID {
+		t.Fatalf("same transmission should deduplicate: first=%d second=%d already=%v err=%v", firstID, secondID, already, err)
+	}
+}
+
+func TestFindRegisteredFileRejectsConflictingIdentity(t *testing.T) {
+	gdb := newImporterTestDB(t)
+	rows := []db.ImportFile{
+		{Filename: "first.xml", SHA256: "hash-one", TransmisjaID: "tx-one"},
+		{Filename: "second.xml", SHA256: "hash-two", TransmisjaID: "tx-two"},
+	}
+	if err := gdb.Create(&rows).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	_, found, err := findRegisteredFile(gdb, "hash-one", "tx-two")
+	if err == nil || found || !strings.Contains(err.Error(), "conflicting import identity") {
+		t.Fatalf("expected explicit identity conflict, found=%v err=%v", found, err)
+	}
+}
+
+func TestImporterIgnoresZipFiles(t *testing.T) {
+	gdb := newImporterTestDB(t)
+	watchDir := t.TempDir()
+	imp := &Importer{log: zerolog.Nop(), db: gdb}
+	path := filepath.Join(watchDir, "exp_wyk_not_supported.zip")
+	if err := os.WriteFile(path, []byte("not an XML import"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	imp.scanOnce(watchDir)
+
+	var imports int64
+	mustCount(t, gdb.Model(&db.ImportFile{}), &imports)
+	if imports != 0 {
+		t.Fatalf("ZIP file created %d import records", imports)
+	}
+	assertFileExists(t, path)
+}
+
+func TestImporterWaitsForStableXMLFile(t *testing.T) {
+	gdb := newImporterTestDB(t)
+	watchDir := t.TempDir()
+	imp := &Importer{log: zerolog.Nop(), db: gdb, cfg: Config{StabilitySeconds: 2}}
+	name := "exp_wyk_stable_20260904120000.xml"
+	path := filepath.Join(watchDir, name)
+	raw := `<?xml version="1.0"?><root><transmisja_id>stable-1</transmisja_id><towary><towar><towar_id>1</towar_id><kod>5901</kod></towar></towary></root>`
+	if err := os.WriteFile(path, []byte(raw), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	imp.scanOnce(watchDir)
+	var imports int64
+	mustCount(t, gdb.Model(&db.ImportFile{}), &imports)
+	if imports != 0 {
+		t.Fatalf("newly observed file should not be imported, got %d records", imports)
+	}
+	observation := imp.observedFiles[path]
+	observation.firstSeen = time.Now().Add(-3 * time.Second)
+	imp.observedFiles[path] = observation
+	imp.scanOnce(watchDir)
+
+	row := mustImportFile(t, gdb, name)
+	if row.Status != 1 {
+		t.Fatalf("stable file was not imported: %+v", row)
+	}
+}
+
+func TestImporterWaitsForWooCacheReadinessBeforeLinkAndPlan(t *testing.T) {
+	gdb := newImporterTestDB(t)
+	watchDir := t.TempDir()
+	towarID := int64(81)
+	wooID := uint(91)
+	if err := gdb.Create(&db.WooProductCache{WooID: wooID, Ean: "5900000000081", StockManaged: true}).Error; err != nil {
+		t.Fatal(err)
+	}
+	raw := `<?xml version="1.0"?><root><transmisja_id>ready-1</transmisja_id><towary><towar>` +
+		`<towar_id>81</towar_id><kod>5900000000081</kod><nazwa>Ready product</nazwa><cena_detal>10</cena_detal>` +
+		`<magazyny><magazyn><magazyn_id>1</magazyn_id><stan_magazynu>2</stan_magazynu></magazyn></magazyny>` +
+		`</towar></towary></root>`
+	if err := os.WriteFile(filepath.Join(watchDir, "exp_wyk_ready.xml"), []byte(raw), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	runtime := integrations.NewRuntime(gdb, true)
+	ctx, cancel := context.WithCancel(integrations.WithRuntime(context.Background(), runtime))
+	defer cancel()
+	imp := &Importer{log: zerolog.Nop(), cfg: Config{WatchDir: watchDir, PollSec: 60}}
+	done := make(chan error, 1)
+	go func() { done <- imp.Start(ctx) }()
+
+	waitForTest(t, time.Second, func() bool {
+		var count int64
+		return gdb.Model(&db.StProduct{}).Where("towar_id = ?", towarID).Count(&count).Error == nil && count == 1
+	})
+	var before db.WooProductCache
+	if err := gdb.Where("woo_id = ?", wooID).Take(&before).Error; err != nil {
+		t.Fatal(err)
+	}
+	if before.TowarID != nil {
+		t.Fatal("importer linked before Woo cache readiness signal")
+	}
+
+	runtime.MarkWooCacheReady()
+	waitForTest(t, time.Second, func() bool {
+		var cache db.WooProductCache
+		return gdb.Where("woo_id = ?", wooID).Take(&cache).Error == nil && cache.TowarID != nil && *cache.TowarID == towarID
+	})
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("importer did not stop")
+	}
+}
+
+func waitForTest(t *testing.T, timeout time.Duration, condition func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if condition() {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatal("condition was not met before timeout")
+}
+
+func TestImportRejectsDuplicateNaturalKeys(t *testing.T) {
+	tests := []struct {
+		name      string
+		body      string
+		wantError string
+	}{
+		{
+			name: "product",
+			body: `<towar><towar_id>1</towar_id><kod>5901</kod></towar>
+<towar><towar_id>1</towar_id><kod>5901</kod></towar>`,
+			wantError: "duplicate product in XML",
+		},
+		{
+			name: "stock",
+			body: `<towar><towar_id>1</towar_id><kod>5901</kod><magazyny>
+<magazyn><magazyn_id>1</magazyn_id><stan_magazynu>2</stan_magazynu></magazyn>
+<magazyn><magazyn_id>1</magazyn_id><stan_magazynu>3</stan_magazynu></magazyn>
+</magazyny></towar>`,
+			wantError: "duplicate stock in XML",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gdb := newImporterTestDB(t)
+			watchDir := t.TempDir()
+			imp := &Importer{log: zerolog.Nop(), db: gdb}
+			name := "exp_wyk_duplicate_" + tt.name + ".xml"
+			path := filepath.Join(watchDir, name)
+			raw := `<?xml version="1.0"?><root><transmisja_id>duplicate-` + tt.name + `</transmisja_id><towary>` + tt.body + `</towary></root>`
+			if err := os.WriteFile(path, []byte(raw), 0o600); err != nil {
+				t.Fatal(err)
+			}
+
+			imp.scanOnce(watchDir)
+
+			importFile := mustImportFile(t, gdb, name)
+			if importFile.Status != 2 || !strings.Contains(importFile.LastError, tt.wantError) {
+				t.Fatalf("duplicate should fail atomically, got status=%d error=%q", importFile.Status, importFile.LastError)
+			}
+			var products, stocks int64
+			mustCount(t, gdb.Model(&db.StProduct{}), &products)
+			mustCount(t, gdb.Model(&db.StStock{}), &stocks)
+			if products != 0 || stocks != 0 {
+				t.Fatalf("duplicate import left partial rows: products=%d stocks=%d", products, stocks)
+			}
+		})
+	}
+}
+
 func snapshotImportDB(t *testing.T, gdb *gorm.DB, importID uint) importSnapshot {
 	t.Helper()
 
@@ -304,23 +588,6 @@ func firstRealXMLFixtureFile(t *testing.T) string {
 	return files[0]
 }
 
-func xmlCheckpointEvery(t *testing.T) int {
-	t.Helper()
-	raw := strings.TrimSpace(os.Getenv(xmlCheckpointEveryEnv))
-	if raw == "" {
-		return defaultCheckpointEvery
-	}
-	n, err := strconv.Atoi(raw)
-	if err != nil || n <= 0 {
-		t.Fatalf("%s must be a positive integer, got %q", xmlCheckpointEveryEnv, raw)
-	}
-	return n
-}
-
-func shouldCheckXMLState(idx, total, every int) bool {
-	return idx == 0 || idx == total-1 || (idx+1)%every == 0
-}
-
 func parseExpectedXMLFile(t *testing.T, path string) ([]expectedProduct, []expectedStock) {
 	t.Helper()
 
@@ -358,22 +625,41 @@ func parseExpectedXMLFile(t *testing.T, path string) ([]expectedProduct, []expec
 		}
 		for _, row := range tw.Items {
 			kod := strings.TrimSpace(row.Kod)
+			kategoriaID, err := i64(row.KategoriaID)
+			if err != nil {
+				t.Fatalf("parse fixture kategoria_id for towar_id=%d: %v", row.TowarID, err)
+			}
+			grupaID, err := i64(row.GrupaID)
+			if err != nil {
+				t.Fatalf("parse fixture asortyment_id for towar_id=%d: %v", row.TowarID, err)
+			}
 			products = append(products, expectedProduct{
-				TowarID:     row.TowarID,
-				Kod:         kod,
-				Nazwa:       strings.TrimSpace(row.Nazwa),
-				VatID:       row.VatID,
-				CenaDetal:   f64(row.CenaDetal),
-				CenaHurtowa: f64(row.CenaHurtowa),
-				AktywnyWSI:  yn(row.AktywnyWSI),
-				DoUsuniecia: yn(row.DoUsuniecia),
+				TowarID:          row.TowarID,
+				Kod:              kod,
+				Nazwa:            strings.TrimSpace(row.Nazwa),
+				Opis1:            row.Opis1,
+				VatID:            row.VatID,
+				KategoriaID:      kategoriaID,
+				GrupaID:          grupaID,
+				JmID:             row.JmID,
+				CenaDetal:        mustF64(t, row.CenaDetal),
+				CenaHurtowa:      mustF64(t, row.CenaHurtowa),
+				CenaNocna:        mustF64(t, row.CenaNocna),
+				CenaDodatkowa:    mustF64(t, row.CenaDodatkowa),
+				CenaDetPrzedProm: mustF64(t, row.CenaDetPrzed),
+				NajCena30Det:     mustF64(t, row.NajCena30Det),
+				AktywnyWSI:       yn(row.AktywnyWSI),
+				DoUsuniecia:      yn(row.DoUsuniecia),
+				DataAktualizacji: row.DataAktualizacji,
+				FolderZdjec:      row.FolderZdjec,
+				PlikZdjecia:      row.PlikZdjecia,
 			})
 			for _, mag := range row.Magazyny {
 				stocks = append(stocks, expectedStock{
 					TowarID:    row.TowarID,
 					MagazynID:  mag.MagazynID,
-					Stan:       f64(mag.Stan),
-					Rezerwacja: f64(mag.Rezerwacja),
+					Stan:       mustF64(t, mag.Stan),
+					Rezerwacja: mustF64(t, mag.Rezerwacja),
 				})
 			}
 		}
@@ -381,10 +667,19 @@ func parseExpectedXMLFile(t *testing.T, path string) ([]expectedProduct, []expec
 	return products, stocks
 }
 
+func mustF64(t *testing.T, raw string) float64 {
+	t.Helper()
+	value, err := f64(raw)
+	if err != nil {
+		t.Fatalf("parse fixture number %q: %v", raw, err)
+	}
+	return value
+}
+
 func applyExpectedImport(state *expectedImportState, importID uint, products []expectedProduct, stocks []expectedStock) {
 	for _, product := range products {
 		product.ImportID = importID
-		state.Products[productKey{TowarID: product.TowarID, Kod: product.Kod}] = product
+		state.Products[product.TowarID] = product
 	}
 	for _, stock := range stocks {
 		key := stockKey{TowarID: stock.TowarID, MagazynID: stock.MagazynID}
@@ -408,17 +703,29 @@ func assertExpectedImportState(t *testing.T, gdb *gorm.DB, expected expectedImpo
 		t.Fatalf("checkpoint %d %s: products count got %d want %d", checkpoint, filename, len(products), len(expected.Products))
 	}
 	for _, got := range products {
-		want, ok := expected.Products[productKey{TowarID: got.TowarID, Kod: got.Kod}]
+		want, ok := expected.Products[got.TowarID]
 		if !ok {
 			t.Fatalf("checkpoint %d %s: unexpected product towar_id=%d kod=%q", checkpoint, filename, got.TowarID, got.Kod)
 		}
 		if got.ImportID != want.ImportID ||
+			got.Kod != want.Kod ||
 			got.Nazwa != want.Nazwa ||
+			got.Opis1 != want.Opis1 ||
 			got.VatID != want.VatID ||
+			got.KategoriaID != want.KategoriaID ||
+			got.GrupaID != want.GrupaID ||
+			got.JmID != want.JmID ||
 			!sameTestFloat(got.CenaDetal, want.CenaDetal) ||
 			!sameTestFloat(got.CenaHurtowa, want.CenaHurtowa) ||
+			!sameTestFloat(got.CenaNocna, want.CenaNocna) ||
+			!sameTestFloat(got.CenaDodatkowa, want.CenaDodatkowa) ||
+			!sameTestFloat(got.CenaDetPrzedProm, want.CenaDetPrzedProm) ||
+			!sameTestFloat(got.NajCena30Det, want.NajCena30Det) ||
 			got.AktywnyWSI != want.AktywnyWSI ||
-			got.DoUsuniecia != want.DoUsuniecia {
+			got.DoUsuniecia != want.DoUsuniecia ||
+			got.DataAktualizacji != want.DataAktualizacji ||
+			got.FolderZdjec != want.FolderZdjec ||
+			got.PlikZdjecia != want.PlikZdjecia {
 			t.Fatalf("checkpoint %d %s: product mismatch for towar_id=%d kod=%q got=%+v want=%+v", checkpoint, filename, got.TowarID, got.Kod, got, want)
 		}
 	}
@@ -559,9 +866,9 @@ func assertNoDuplicateImportRows(t *testing.T, gdb *gorm.DB) {
 	var duplicateProducts int64
 	if err := gdb.Raw(`
 SELECT COUNT(*) FROM (
-	SELECT towar_id, kod
+	SELECT towar_id
 	FROM st_products
-	GROUP BY towar_id, kod
+	GROUP BY towar_id
 	HAVING COUNT(*) > 1
 ) AS duplicates;
 `).Scan(&duplicateProducts).Error; err != nil {

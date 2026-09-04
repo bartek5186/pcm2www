@@ -4,6 +4,7 @@ package conf
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -41,6 +42,13 @@ type WooDefaults struct {
 	CustomFields []woocommerce.CustomFieldConfig `json:"custom_fields,omitempty"`
 }
 
+type ImporterDefaults struct {
+	WatchDir         string `json:"watch_dir"`
+	PollSec          int    `json:"poll_sec"`
+	PriceMode        string `json:"price_mode"`
+	StabilitySeconds int    `json:"stability_seconds"`
+}
+
 func LoadOrCreate(path string) (*Config, bool, error) {
 	// upewnij się, że katalog istnieje
 	_ = os.MkdirAll(filepath.Dir(path), 0o755)
@@ -48,7 +56,9 @@ func LoadOrCreate(path string) (*Config, bool, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			// domyślny config
+			// Pierwszy plik jest kompletnym, ale nieaktywnym szablonem. AutoStart
+			// pozostaje false, dopóki użytkownik nie wpisze danych Woo i nie
+			// potwierdzi katalogu importu.
 			woo := WooDefaults{
 				BaseURL:     "https://example.com",
 				ConsumerKey: "ck_xxx",
@@ -58,7 +68,7 @@ func LoadOrCreate(path string) (*Config, bool, error) {
 				Cache: woocommerce.WooCache{
 					PrimeOnStart:         true,
 					SweepIntervalMinutes: 360, //6h
-					Fields:               "id,sku,name,regular_price,sale_price,stock_quantity,manage_stock,status,date_modified_gmt,type,global_unique_id",
+					Fields:               "id,sku,name,regular_price,sale_price,tax_class,stock_quantity,manage_stock,stock_status,backorders,catalog_visibility,status,date_modified_gmt,type,global_unique_id,ean",
 				},
 				CustomFields: []woocommerce.CustomFieldConfig{
 					{
@@ -71,6 +81,12 @@ func LoadOrCreate(path string) (*Config, bool, error) {
 				},
 			}
 			rawWoo, _ := json.Marshal(woo)
+			rawImporter, _ := json.Marshal(ImporterDefaults{
+				WatchDir:         "~/pcm2www/imports",
+				PollSec:          5,
+				PriceMode:        "gross",
+				StabilitySeconds: 2,
+			})
 
 			cfg := &Config{
 				Database: DBConfig{
@@ -80,8 +96,8 @@ func LoadOrCreate(path string) (*Config, bool, error) {
 				SyncIntervalSeconds: 5,
 				Integrations: map[string]json.RawMessage{
 					"woocommerce": rawWoo,
+					"importer":    rawImporter,
 				},
-				WatchDir: "./xml_in", // jeśli nie używasz, możesz usunąć
 			}
 			if err := Save(path, cfg); err != nil {
 				return nil, false, fmt.Errorf("błąd zapisu domyślnego configa: %w", err)
@@ -93,7 +109,15 @@ func LoadOrCreate(path string) (*Config, bool, error) {
 	defer f.Close()
 
 	var cfg Config
-	if err := json.NewDecoder(f).Decode(&cfg); err != nil {
+	dec := json.NewDecoder(f)
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&cfg); err != nil {
+		return nil, false, fmt.Errorf("błąd parsowania configa: %w", err)
+	}
+	if err := dec.Decode(&struct{}{}); err != io.EOF {
+		if err == nil {
+			return nil, false, fmt.Errorf("błąd parsowania configa: wiele dokumentów JSON")
+		}
 		return nil, false, fmt.Errorf("błąd parsowania configa: %w", err)
 	}
 	if cfg.Integrations == nil {
@@ -102,7 +126,28 @@ func LoadOrCreate(path string) (*Config, bool, error) {
 	if strings.TrimSpace(cfg.Database.Driver) == "" {
 		cfg.Database.Driver = "sqlite"
 	}
+	if err := cfg.Validate(); err != nil {
+		return nil, false, err
+	}
 	return &cfg, false, nil
+}
+
+func (c *Config) Validate() error {
+	if c == nil {
+		return fmt.Errorf("config jest pusty")
+	}
+	switch strings.ToLower(strings.TrimSpace(c.Database.Driver)) {
+	case "sqlite", "postgres", "postgresql", "mysql":
+	default:
+		return fmt.Errorf("nieobsługiwany database.driver %q", c.Database.Driver)
+	}
+	if c.SyncIntervalSeconds < 0 {
+		return fmt.Errorf("sync_interval_seconds nie może być ujemne")
+	}
+	if len(c.Integrations) == 0 {
+		return fmt.Errorf("brak integracji w konfiguracji")
+	}
+	return nil
 }
 
 func Save(path string, cfg *Config) error {

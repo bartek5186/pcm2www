@@ -8,7 +8,9 @@ import (
 	"encoding/json"
 	"encoding/xml"
 	"errors"
+	"fmt"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -24,18 +26,27 @@ import (
 )
 
 type Config struct {
-	WatchDir  string `json:"watch_dir"`            // np. ~/pcm2www/imports
-	PollSec   int    `json:"poll_sec"`             // np. 5-10s w dev
-	PriceMode string `json:"price_mode,omitempty"` // gross (domyślnie) albo net
+	WatchDir         string `json:"watch_dir"`                   // np. ~/pcm2www/imports
+	PollSec          int    `json:"poll_sec"`                    // np. 5-10s w dev
+	PriceMode        string `json:"price_mode,omitempty"`        // gross (domyślnie) albo net
+	StabilitySeconds int    `json:"stability_seconds,omitempty"` // plik musi być niezmienny przez ten czas
 }
 
 type Importer struct {
 	log zerolog.Logger
 	cfg Config
 
-	ctx    context.Context
-	cancel context.CancelFunc
-	db     *gorm.DB
+	ctx           context.Context
+	cancel        context.CancelFunc
+	db            *gorm.DB
+	runtime       *integrations.Runtime
+	observedFiles map[string]fileObservation
+}
+
+type fileObservation struct {
+	size      int64
+	modified  time.Time
+	firstSeen time.Time
 }
 
 // minimalny model pod to, co potrzebujesz teraz
@@ -44,13 +55,6 @@ type xmlMagazyn struct {
 	Stan       string `xml:"stan_magazynu"`     // może być "", więc string
 	Rezerwacja string `xml:"rezerwacja_ilosci"` // jw.
 }
-
-// liczniki
-var (
-	seenTowar   int
-	insProducts int
-	insStocks   int
-)
 
 type xmlTowar struct {
 	TowarID     int64  `xml:"towar_id"`
@@ -85,43 +89,65 @@ func (i *Importer) Start(ctx context.Context) error {
 	i.ctx, i.cancel = context.WithCancel(ctx)
 	i.log.Info().Str("integration", i.Name()).Msg("start")
 
-	// wyciągnij DB z contextu (patrz: Syncer.Start)
-	raw := ctx.Value("gormDB")
-	gdb, _ := raw.(*gorm.DB)
+	runtime, err := integrations.RuntimeFromContext(ctx)
+	if err != nil {
+		return fmt.Errorf("importer: %w", err)
+	}
+	gdb := runtime.DB
 	if gdb == nil {
 		return errors.New("importer: brak *gorm.DB w kontekście")
 	}
 	i.db = gdb
-
-	// DEV: powtórny relink po 15 sekundach od startu, żeby Woo cache już był
-	go func() {
-		time.Sleep(15 * time.Second)
-		if err := i.LinkProductsByEAN(); err != nil {
-			i.log.Error().Err(err).Msg("LinkProductsByEAN retry failed")
-			return
-		}
-		if err := i.PlanWooTasksForRecentImports(24 * time.Hour); err != nil {
-			i.log.Error().Err(err).Msg("PlanWooTasksForRecentImports retry failed")
-		}
-	}()
+	i.runtime = runtime
+	if i.observedFiles == nil {
+		i.observedFiles = make(map[string]fileObservation)
+	}
 
 	dir := expandHome(i.cfg.WatchDir)
+	if info, err := os.Stat(dir); err != nil {
+		return fmt.Errorf("importer: katalog %q: %w", dir, err)
+	} else if !info.IsDir() {
+		return fmt.Errorf("importer: %q nie jest katalogiem", dir)
+	}
 	ticker := time.NewTicker(i.interval())
 	defer ticker.Stop()
 
 	// pierwszy przebieg
 	i.scanOnce(dir)
+	ready := runtime.WooCacheReady()
+	if runtime.IsWooCacheReady() {
+		if err := i.linkAndPlanCurrentStaging(); err != nil {
+			return err
+		}
+		ready = nil
+	}
 
 	for {
 		select {
 		case <-i.ctx.Done():
 			i.log.Info().Str("integration", i.Name()).Msg("stop")
 			return nil
+		case <-ready:
+			ready = nil
+			if err := i.linkAndPlanCurrentStaging(); err != nil {
+				return fmt.Errorf("importer: link/plan after Woo cache readiness: %w", err)
+			}
 		case <-ticker.C:
 			i.scanOnce(dir)
 			ticker.Reset(i.interval())
 		}
 	}
+}
+
+func (i *Importer) linkAndPlanCurrentStaging() error {
+	if err := i.LinkProductsByEAN(); err != nil {
+		return err
+	}
+	var ids []uint
+	if err := i.db.Model(&db.StProduct{}).Distinct().Order("import_id ASC").Pluck("import_id", &ids).Error; err != nil {
+		return fmt.Errorf("load current staging import ids: %w", err)
+	}
+	return i.PlanWooTasksForImports(ids)
 }
 
 func (i *Importer) Stop() {
@@ -152,12 +178,15 @@ func (i *Importer) scanOnce(dir string) {
 			continue
 		}
 		name := e.Name()
-		if !strings.HasPrefix(name, "exp_wyk_") || !(strings.HasSuffix(name, ".xml") || strings.HasSuffix(name, ".zip")) {
+		if !isImportXMLName(name) {
 			continue
 		}
 		full := filepath.Join(dir, name)
+		if !i.fileReady(full) {
+			continue
+		}
 
-		// dedup po filename/sha/transmisja_id
+		// dedup po SHA256 lub niepustym transmisja_id
 		importID, already, err := i.registerFile(full, name)
 		if err != nil {
 			i.log.Error().Err(err).Str("file", name).Msg("rejestracja pliku nieudana")
@@ -177,6 +206,7 @@ func (i *Importer) scanOnce(dir string) {
 					if archivedPath, err := archiveProcessedFile(dir, full, name, importID); err != nil {
 						i.log.Error().Err(err).Str("file", name).Msg("archiwizacja już przetworzonego pliku nieudana")
 					} else {
+						delete(i.observedFiles, full)
 						i.log.Info().Str("file", name).Str("archived_path", archivedPath).Msg("przeniesiono już przetworzony plik do parsed")
 					}
 					continue
@@ -190,26 +220,24 @@ func (i *Importer) scanOnce(dir string) {
 		// PRZETWARZANIE
 		if err := i.processFile(importID, full); err != nil {
 			i.log.Error().Err(err).Str("file", name).Uint("import_id", importID).Msg("błąd przetwarzania pliku")
-			_ = i.db.Model(&db.ImportFile{}).Where("import_id = ?", importID).
-				Updates(map[string]any{"status": 2, "last_error": err.Error()})
+			if persistErr := i.db.Model(&db.ImportFile{}).Where("import_id = ?", importID).
+				Updates(map[string]any{"status": 2, "last_error": err.Error()}).Error; persistErr != nil {
+				i.log.Error().Err(persistErr).Uint("import_id", importID).Msg("nie można zapisać błędu importu")
+			}
 			continue
 		}
-		// sukces
-		now := time.Now()
-		_ = i.db.Model(&db.ImportFile{}).Where("import_id = ?", importID).
-			Updates(map[string]any{"status": 1, "processed_at": now})
-
 		archivedPath, archiveErr := archiveProcessedFile(dir, full, name, importID)
 		if archiveErr != nil {
 			i.log.Error().Err(archiveErr).Str("file", name).Uint("import_id", importID).Msg("archiwizacja przetworzonego pliku nieudana")
 		}
+		delete(i.observedFiles, full)
 
 		i.log.Info().Str("file", name).Str("archived_path", archivedPath).Uint("import_id", importID).Msg("przetworzono OK")
 		processed = true
 		processedImportIDs = append(processedImportIDs, importID)
 	}
 
-	if processed {
+	if processed && (i.runtime == nil || i.runtime.IsWooCacheReady()) {
 		if err := i.LinkProductsByEAN(); err != nil {
 			i.log.Error().Err(err).Msg("LinkProductsByEAN failed after import")
 			return
@@ -219,6 +247,31 @@ func (i *Importer) scanOnce(dir string) {
 		}
 	}
 
+}
+
+func (i *Importer) fileReady(path string) bool {
+	if i.cfg.StabilitySeconds <= 0 {
+		return true
+	}
+	if i.observedFiles == nil {
+		i.observedFiles = make(map[string]fileObservation)
+	}
+	info, err := os.Stat(path)
+	if err != nil || !info.Mode().IsRegular() {
+		return false
+	}
+	now := time.Now()
+	previous, ok := i.observedFiles[path]
+	if !ok || previous.size != info.Size() || !previous.modified.Equal(info.ModTime()) {
+		i.observedFiles[path] = fileObservation{size: info.Size(), modified: info.ModTime(), firstSeen: now}
+		return false
+	}
+	return now.Sub(previous.firstSeen) >= time.Duration(i.cfg.StabilitySeconds)*time.Second
+}
+
+func isImportXMLName(name string) bool {
+	name = strings.ToLower(strings.TrimSpace(name))
+	return strings.HasPrefix(name, "exp_wyk_") && strings.HasSuffix(name, ".xml")
 }
 
 func archiveProcessedFile(dir, fullPath, name string, importID uint) (string, error) {
@@ -261,12 +314,10 @@ func (i *Importer) registerFile(fullPath, name string) (uint, bool, error) {
 		return 0, false, err
 	}
 
-	// spróbuj odczytać transmisja_id (jeśli to XML)
+	// Odczytaj transmisja_id z obsługiwanego XML-a.
 	transID := ""
-	if strings.HasSuffix(strings.ToLower(name), ".xml") {
-		if tid, _ := readTransmisjaID(fullPath); tid != "" {
-			transID = tid
-		}
+	if tid, _ := readTransmisjaID(fullPath); tid != "" {
+		transID = tid
 	}
 
 	rec := db.ImportFile{
@@ -278,18 +329,73 @@ func (i *Importer) registerFile(fullPath, name string) (uint, bool, error) {
 		Status:       0,
 	}
 
-	// idempotencja: po SHA lub nazwie/transmisja_id
-	var existing db.ImportFile
-	if err := i.db.
-		Where("sha256 = ? OR filename = ? OR (transmisja_id <> '' AND transmisja_id = ?)", h, name, transID).
-		Take(&existing).Error; err == nil {
+	// Tożsamością pliku jest zawartość albo niepuste ID transmisji. Nazwa jest
+	// tylko metadanym i może zostać ponownie użyta przez PC-Market.
+	existing, found, err := findRegisteredFile(i.db, h, transID)
+	if err != nil {
+		return 0, false, err
+	}
+	if found {
+		if existing.Status != 1 && existing.SHA256 != h {
+			if err := i.db.Model(&db.ImportFile{}).Where("import_id = ?", existing.ImportID).Updates(map[string]any{
+				"filename": name, "sha256": h, "size_bytes": fi.Size(), "file_time_utc": rec.FileTimeUTC,
+			}).Error; err != nil {
+				return 0, false, fmt.Errorf("refresh failed import identity: %w", err)
+			}
+		}
 		return existing.ImportID, true, nil
 	}
 
 	if err := i.db.Create(&rec).Error; err != nil {
+		// SHA ma indeks unikalny. Jeśli drugi proces wygrał wyścig między SELECT
+		// i INSERT, odczytaj utworzony przez niego rekord jako duplikat.
+		existing, found, lookupErr := findRegisteredFile(i.db, h, transID)
+		if lookupErr != nil {
+			return 0, false, fmt.Errorf("lookup after import registration failure: %w (insert: %v)", lookupErr, err)
+		}
+		if found {
+			return existing.ImportID, true, nil
+		}
 		return 0, false, err
 	}
 	return rec.ImportID, false, nil
+}
+
+func findRegisteredFile(gdb *gorm.DB, sha256, transmissionID string) (db.ImportFile, bool, error) {
+	bySHA, foundSHA, err := lookupImportFile(gdb, "sha256 = ?", sha256)
+	if err != nil {
+		return db.ImportFile{}, false, err
+	}
+	if transmissionID == "" {
+		return bySHA, foundSHA, nil
+	}
+
+	byTransmission, foundTransmission, err := lookupImportFile(gdb, "transmisja_id = ?", transmissionID)
+	if err != nil {
+		return db.ImportFile{}, false, err
+	}
+	if foundSHA && foundTransmission && bySHA.ImportID != byTransmission.ImportID {
+		return db.ImportFile{}, false, fmt.Errorf(
+			"conflicting import identity: sha256 belongs to import_id=%d, transmisja_id=%q belongs to import_id=%d",
+			bySHA.ImportID, transmissionID, byTransmission.ImportID,
+		)
+	}
+	if foundSHA {
+		return bySHA, true, nil
+	}
+	return byTransmission, foundTransmission, nil
+}
+
+func lookupImportFile(gdb *gorm.DB, query string, arg any) (db.ImportFile, bool, error) {
+	var existing db.ImportFile
+	err := gdb.Where(query, arg).Order("import_id ASC").Take(&existing).Error
+	if err == nil {
+		return existing, true, nil
+	}
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return db.ImportFile{}, false, nil
+	}
+	return db.ImportFile{}, false, err
 }
 
 func (i *Importer) processFile(importID uint, fullPath string) error {
@@ -305,166 +411,246 @@ func (i *Importer) processFile(importID uint, fullPath string) error {
 		return charset.NewReaderLabel(normalizeCharset(cs), in)
 	}
 
-	const batchSize = 500
-	prodBatch := make([]db.StProduct, 0, batchSize)
-	stockBatch := make([]db.StStock, 0, batchSize)
-
-	tx := i.db.Begin()
-	committed := false
-	defer func() {
-		if !committed {
-			_ = tx.Rollback().Error
-		}
-	}()
-
 	insProducts, insStocks := 0, 0
-
-	// ✅ Upsert w batchach
-	flushBatches := func(tx *gorm.DB) error {
-		// ---- produkty ----
-		if len(prodBatch) > 0 {
-			err := tx.Clauses(clause.OnConflict{
-				Columns: []clause.Column{{Name: "towar_id"}, {Name: "kod"}},
-				DoUpdates: clause.Assignments(map[string]interface{}{
-					"nazwa":               gorm.Expr("excluded.nazwa"),
-					"opis1":               gorm.Expr("excluded.opis1"),
-					"vat_id":              gorm.Expr("excluded.vat_id"),
-					"kategoria_id":        gorm.Expr("excluded.kategoria_id"),
-					"grupa_id":            gorm.Expr("excluded.grupa_id"),
-					"jm_id":               gorm.Expr("excluded.jm_id"),
-					"cena_detal":          gorm.Expr("excluded.cena_detal"),
-					"cena_hurtowa":        gorm.Expr("excluded.cena_hurtowa"),
-					"cena_nocna":          gorm.Expr("excluded.cena_nocna"),
-					"cena_dodatkowa":      gorm.Expr("excluded.cena_dodatkowa"),
-					"cena_det_przed_prom": gorm.Expr("excluded.cena_det_przed_prom"),
-					"naj_cena30_det":      gorm.Expr("excluded.naj_cena30_det"),
-					"aktywny_wsi":         gorm.Expr("excluded.aktywny_wsi"),
-					"do_usuniecia":        gorm.Expr("excluded.do_usuniecia"),
-					"data_aktualizacji":   gorm.Expr("excluded.data_aktualizacji"),
-					"folder_zdjec":        gorm.Expr("excluded.folder_zdjec"),
-					"plik_zdjecia":        gorm.Expr("excluded.plik_zdjecia"),
-					"import_id":           gorm.Expr("excluded.import_id"),
-					"updated_at":          gorm.Expr("CURRENT_TIMESTAMP"),
-				}),
-			}).Create(&prodBatch).Error
-			if err != nil {
-				i.log.Error().Err(err).Int("n", len(prodBatch)).Msg("upsert st_products batch failed")
-				return err
-			}
-			insProducts += len(prodBatch)
-			prodBatch = prodBatch[:0]
+	if err := i.db.Transaction(func(tx *gorm.DB) error {
+		const batchSize = 500
+		prodBatch := make([]db.StProduct, 0, batchSize)
+		stockBatch := make([]db.StStock, 0, batchSize)
+		type stockKey struct {
+			TowarID   int64
+			MagazynID int64
 		}
+		seenProducts := make(map[int64]struct{})
+		seenStocks := make(map[stockKey]struct{})
 
-		// ---- stany ----
-		if len(stockBatch) > 0 {
-			err := tx.Clauses(clause.OnConflict{
-				Columns: []clause.Column{{Name: "towar_id"}, {Name: "magazyn_id"}},
-				DoUpdates: clause.Assignments(map[string]interface{}{
-					"stan_prev":  gorm.Expr("stan"),
-					"stan":       gorm.Expr("excluded.stan"),
-					"rezerwacja": gorm.Expr("excluded.rezerwacja"),
-					"import_id":  gorm.Expr("excluded.import_id"),
-					"updated_at": gorm.Expr("CURRENT_TIMESTAMP"),
-				}),
-			}).Create(&stockBatch).Error
-			if err != nil {
-				i.log.Error().Err(err).Int("n", len(stockBatch)).Msg("upsert st_stock batch failed")
-				return err
-			}
-			insStocks += len(stockBatch)
-			stockBatch = stockBatch[:0]
-		}
-		return nil
-	}
-
-	for {
-		tok, err := dec.Token()
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			return err
-		}
-
-		switch se := tok.(type) {
-		case xml.StartElement:
-			// transmisja_id
-			if strings.EqualFold(se.Name.Local, "transmisja_id") {
-				var tid string
-				if err := dec.DecodeElement(&tid, &se); err != nil {
+		// ✅ Upsert w batchach
+		flushBatches := func(tx *gorm.DB) error {
+			// ---- produkty ----
+			if len(prodBatch) > 0 {
+				err := tx.Clauses(clause.OnConflict{
+					Columns: []clause.Column{{Name: "towar_id"}},
+					DoUpdates: clause.Assignments(map[string]interface{}{
+						"kod":                 gorm.Expr("excluded.kod"),
+						"nazwa":               gorm.Expr("excluded.nazwa"),
+						"opis1":               gorm.Expr("excluded.opis1"),
+						"vat_id":              gorm.Expr("excluded.vat_id"),
+						"kategoria_id":        gorm.Expr("excluded.kategoria_id"),
+						"grupa_id":            gorm.Expr("excluded.grupa_id"),
+						"jm_id":               gorm.Expr("excluded.jm_id"),
+						"cena_detal":          gorm.Expr("excluded.cena_detal"),
+						"cena_hurtowa":        gorm.Expr("excluded.cena_hurtowa"),
+						"cena_nocna":          gorm.Expr("excluded.cena_nocna"),
+						"cena_dodatkowa":      gorm.Expr("excluded.cena_dodatkowa"),
+						"cena_det_przed_prom": gorm.Expr("excluded.cena_det_przed_prom"),
+						"naj_cena30_det":      gorm.Expr("excluded.naj_cena30_det"),
+						"aktywny_wsi":         gorm.Expr("excluded.aktywny_wsi"),
+						"do_usuniecia":        gorm.Expr("excluded.do_usuniecia"),
+						"data_aktualizacji":   gorm.Expr("excluded.data_aktualizacji"),
+						"folder_zdjec":        gorm.Expr("excluded.folder_zdjec"),
+						"plik_zdjecia":        gorm.Expr("excluded.plik_zdjecia"),
+						"import_id":           gorm.Expr("excluded.import_id"),
+						"updated_at":          gorm.Expr("CURRENT_TIMESTAMP"),
+					}),
+				}).Create(&prodBatch).Error
+				if err != nil {
+					i.log.Error().Err(err).Int("n", len(prodBatch)).Msg("upsert st_products batch failed")
 					return err
 				}
-				tid = strings.TrimSpace(tid)
-				if tid != "" {
-					_ = tx.Model(&db.ImportFile{}).
-						Where("import_id = ?", importID).
-						Update("transmisja_id", tid).Error
-				}
-				continue
+				insProducts += len(prodBatch)
+				prodBatch = prodBatch[:0]
 			}
 
-			// towary
-			if strings.EqualFold(se.Name.Local, "towary") {
-				var tw struct {
-					Items []xmlTowar `xml:"towar"`
-				}
-				if err := dec.DecodeElement(&tw, &se); err != nil {
+			// ---- stany ----
+			if len(stockBatch) > 0 {
+				err := tx.Clauses(clause.OnConflict{
+					Columns: []clause.Column{{Name: "towar_id"}, {Name: "magazyn_id"}},
+					DoUpdates: clause.Assignments(map[string]interface{}{
+						"stan_prev":  gorm.Expr("stan"),
+						"stan":       gorm.Expr("excluded.stan"),
+						"rezerwacja": gorm.Expr("excluded.rezerwacja"),
+						"import_id":  gorm.Expr("excluded.import_id"),
+						"updated_at": gorm.Expr("CURRENT_TIMESTAMP"),
+					}),
+				}).Create(&stockBatch).Error
+				if err != nil {
+					i.log.Error().Err(err).Int("n", len(stockBatch)).Msg("upsert st_stock batch failed")
 					return err
 				}
+				insStocks += len(stockBatch)
+				stockBatch = stockBatch[:0]
+			}
+			return nil
+		}
 
-				for _, t := range tw.Items {
-					prodBatch = append(prodBatch, db.StProduct{
-						ImportID:         importID,
-						TowarID:          t.TowarID,
-						Kod:              strings.TrimSpace(t.Kod),
-						Nazwa:            strings.TrimSpace(t.Nazwa),
-						Opis1:            t.Opis1,
-						VatID:            t.VatID,
-						KategoriaID:      i64(t.KategoriaID),
-						GrupaID:          i64(t.GrupaID),
-						JmID:             t.JmID,
-						CenaDetal:        f64(t.CenaDetal),
-						CenaHurtowa:      f64(t.CenaHurtowa),
-						CenaNocna:        f64(t.CenaNocna),
-						CenaDodatkowa:    f64(t.CenaDodatkowa),
-						CenaDetPrzedProm: f64(t.CenaDetPrzed),
-						NajCena30Det:     f64(t.NajCena30Det),
-						AktywnyWSI:       yn(t.AktywnyWSI),
-						DoUsuniecia:      yn(t.DoUsuniecia),
-						DataAktualizacji: t.DataAktualizacji,
-						FolderZdjec:      t.FolderZdjec,
-						PlikZdjecia:      t.PlikZdjecia,
-					})
+		for {
+			tok, err := dec.Token()
+			if err == io.EOF {
+				break
+			}
+			if err != nil {
+				return err
+			}
 
-					for _, m := range t.Magazyny {
-						stockBatch = append(stockBatch, db.StStock{
-							ImportID:   importID,
-							TowarID:    t.TowarID,
-							MagazynID:  m.MagazynID,
-							Stan:       f64(m.Stan),
-							Rezerwacja: f64(m.Rezerwacja),
-						})
+			switch se := tok.(type) {
+			case xml.StartElement:
+				// transmisja_id
+				if strings.EqualFold(se.Name.Local, "transmisja_id") {
+					var tid string
+					if err := dec.DecodeElement(&tid, &se); err != nil {
+						return err
+					}
+					tid = strings.TrimSpace(tid)
+					if tid != "" {
+						if err := tx.Model(&db.ImportFile{}).
+							Where("import_id = ?", importID).
+							Update("transmisja_id", tid).Error; err != nil {
+							return fmt.Errorf("update transmisja_id: %w", err)
+						}
+					}
+					continue
+				}
+
+				// towary
+				if strings.EqualFold(se.Name.Local, "towary") {
+					var tw struct {
+						Items []xmlTowar `xml:"towar"`
+					}
+					if err := dec.DecodeElement(&tw, &se); err != nil {
+						return err
 					}
 
-					if len(prodBatch) >= batchSize || len(stockBatch) >= batchSize {
-						if err := flushBatches(tx); err != nil {
+					for _, t := range tw.Items {
+						kod := strings.TrimSpace(t.Kod)
+						if _, duplicate := seenProducts[t.TowarID]; duplicate {
+							return fmt.Errorf("duplicate product in XML: towar_id=%d (latest kod=%q)", t.TowarID, kod)
+						}
+						seenProducts[t.TowarID] = struct{}{}
+
+						parseFloat := func(field, raw string) (float64, error) {
+							value, err := f64(raw)
+							if err != nil {
+								return 0, fmt.Errorf("towar_id=%d: invalid %s: %w", t.TowarID, field, err)
+							}
+							return value, nil
+						}
+
+						kategoriaID, err := i64(t.KategoriaID)
+						if err != nil {
+							return fmt.Errorf("towar_id=%d: invalid kategoria_id: %w", t.TowarID, err)
+						}
+						grupaID, err := i64(t.GrupaID)
+						if err != nil {
+							return fmt.Errorf("towar_id=%d: invalid asortyment_id: %w", t.TowarID, err)
+						}
+						cenaDetal, err := parseFloat("cena_detal", t.CenaDetal)
+						if err != nil {
 							return err
+						}
+						cenaHurtowa, err := parseFloat("cena_hurtowa", t.CenaHurtowa)
+						if err != nil {
+							return err
+						}
+						cenaNocna, err := parseFloat("cena_nocna", t.CenaNocna)
+						if err != nil {
+							return err
+						}
+						cenaDodatkowa, err := parseFloat("cena_dodatkowa", t.CenaDodatkowa)
+						if err != nil {
+							return err
+						}
+						cenaDetPrzed, err := parseFloat("cena_detal_przed_prom", t.CenaDetPrzed)
+						if err != nil {
+							return err
+						}
+						najCena30Det, err := parseFloat("najnizsza_cena_30_dni_detal", t.NajCena30Det)
+						if err != nil {
+							return err
+						}
+
+						prodBatch = append(prodBatch, db.StProduct{
+							ImportID:         importID,
+							TowarID:          t.TowarID,
+							Kod:              kod,
+							Nazwa:            strings.TrimSpace(t.Nazwa),
+							Opis1:            t.Opis1,
+							VatID:            t.VatID,
+							KategoriaID:      kategoriaID,
+							GrupaID:          grupaID,
+							JmID:             t.JmID,
+							CenaDetal:        cenaDetal,
+							CenaHurtowa:      cenaHurtowa,
+							CenaNocna:        cenaNocna,
+							CenaDodatkowa:    cenaDodatkowa,
+							CenaDetPrzedProm: cenaDetPrzed,
+							NajCena30Det:     najCena30Det,
+							AktywnyWSI:       yn(t.AktywnyWSI),
+							DoUsuniecia:      yn(t.DoUsuniecia),
+							DataAktualizacji: t.DataAktualizacji,
+							FolderZdjec:      t.FolderZdjec,
+							PlikZdjecia:      t.PlikZdjecia,
+						})
+
+						for _, m := range t.Magazyny {
+							skey := stockKey{TowarID: t.TowarID, MagazynID: m.MagazynID}
+							if _, duplicate := seenStocks[skey]; duplicate {
+								return fmt.Errorf("duplicate stock in XML: towar_id=%d magazyn_id=%d", t.TowarID, m.MagazynID)
+							}
+							seenStocks[skey] = struct{}{}
+
+							stan, err := parseFloat("stan_magazynu", m.Stan)
+							if err != nil {
+								return err
+							}
+							rezerwacja, err := parseFloat("rezerwacja_ilosci", m.Rezerwacja)
+							if err != nil {
+								return err
+							}
+							stockBatch = append(stockBatch, db.StStock{
+								ImportID:   importID,
+								TowarID:    t.TowarID,
+								MagazynID:  m.MagazynID,
+								Stan:       stan,
+								Rezerwacja: rezerwacja,
+							})
+						}
+
+						if len(prodBatch) >= batchSize || len(stockBatch) >= batchSize {
+							if err := flushBatches(tx); err != nil {
+								return err
+							}
 						}
 					}
 				}
 			}
 		}
-	}
 
-	if err := flushBatches(tx); err != nil {
+		if err := flushBatches(tx); err != nil {
+			return err
+		}
+		var registered db.ImportFile
+		if err := tx.Select("sha256").Where("import_id = ?", importID).Take(&registered).Error; err != nil {
+			return fmt.Errorf("load registered file hash: %w", err)
+		}
+		currentHash, err := fileSHA256(fullPath)
+		if err != nil {
+			return fmt.Errorf("verify XML after parsing: %w", err)
+		}
+		if currentHash != registered.SHA256 {
+			return fmt.Errorf("XML changed while it was being imported")
+		}
+
+		processedAt := time.Now()
+		if err := tx.Model(&db.ImportFile{}).Where("import_id = ?", importID).Updates(map[string]any{
+			"status":       1,
+			"last_error":   "",
+			"processed_at": processedAt,
+		}).Error; err != nil {
+			return fmt.Errorf("mark import done: %w", err)
+		}
+		return nil
+	}); err != nil {
 		return err
 	}
-
-	if err := tx.Commit().Error; err != nil {
-		i.log.Error().Err(err).Msg("tx commit failed")
-		return err
-	}
-	committed = true
 
 	i.log.Info().
 		Uint("import_id", importID).
@@ -539,8 +725,28 @@ func expandHome(p string) string {
 
 func factory(log zerolog.Logger, raw json.RawMessage) (integrations.Integration, error) {
 	var cfg Config
-	if err := json.Unmarshal(raw, &cfg); err != nil {
+	dec := json.NewDecoder(strings.NewReader(string(raw)))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&cfg); err != nil {
 		return nil, err
+	}
+	if strings.TrimSpace(cfg.WatchDir) == "" {
+		return nil, errors.New("importer: watch_dir is required")
+	}
+	dir := expandHome(cfg.WatchDir)
+	if info, err := os.Stat(dir); err != nil {
+		return nil, fmt.Errorf("importer: watch_dir %q: %w", dir, err)
+	} else if !info.IsDir() {
+		return nil, fmt.Errorf("importer: watch_dir %q is not a directory", dir)
+	}
+	if cfg.PollSec < 0 {
+		return nil, errors.New("importer: poll_sec cannot be negative")
+	}
+	if cfg.StabilitySeconds < 0 {
+		return nil, errors.New("importer: stability_seconds cannot be negative")
+	}
+	if cfg.StabilitySeconds == 0 {
+		cfg.StabilitySeconds = 2
 	}
 	mode, err := normalizePriceMode(cfg.PriceMode)
 	if err != nil {
@@ -576,22 +782,27 @@ func yn(s string) bool {
 	}
 }
 
-func f64(s string) float64 {
+func f64(s string) (float64, error) {
 	s = strings.TrimSpace(s)
 	if s == "" {
-		return 0
+		return 0, nil
 	}
 	// zamień ewentualny przecinek na kropkę
 	s = strings.ReplaceAll(s, ",", ".")
-	v, _ := strconv.ParseFloat(s, 64)
-	return v
+	v, err := strconv.ParseFloat(s, 64)
+	if err != nil {
+		return 0, err
+	}
+	if math.IsNaN(v) || math.IsInf(v, 0) {
+		return 0, fmt.Errorf("non-finite number %q", s)
+	}
+	return v, nil
 }
 
-func i64(s string) int64 {
+func i64(s string) (int64, error) {
 	s = strings.TrimSpace(s)
 	if s == "" {
-		return 0
+		return 0, nil
 	}
-	v, _ := strconv.ParseInt(s, 10, 64)
-	return v
+	return strconv.ParseInt(s, 10, 64)
 }

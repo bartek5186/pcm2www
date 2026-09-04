@@ -4,6 +4,7 @@ package woocommerce
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -17,11 +18,15 @@ import (
 )
 
 func (w *Woo) primeCache(ctx context.Context, gdb *gorm.DB) error {
-	base, _ := url.Parse(w.cfg.BaseURL)
+	base, err := url.Parse(w.cfg.BaseURL)
+	if err != nil {
+		return fmt.Errorf("invalid Woo base URL: %w", err)
+	}
 	base.Path = "/wp-json/wc/v3/products"
 
 	perPage := 100
 	page := 1
+	seenWooIDs := make(map[uint]struct{})
 
 	client := w.http
 	if client == nil {
@@ -34,6 +39,7 @@ func (w *Woo) primeCache(ctx context.Context, gdb *gorm.DB) error {
 		q.Set("order", "desc")
 		q.Set("per_page", strconv.Itoa(perPage))
 		q.Set("page", strconv.Itoa(page))
+		q.Set("status", "any")
 		q.Set("_fields", w.productFields())
 
 		base.RawQuery = q.Encode()
@@ -72,6 +78,7 @@ func (w *Woo) primeCache(ctx context.Context, gdb *gorm.DB) error {
 		rows = make([]db.WooProductCache, 0, len(items))
 
 		for _, p := range items {
+			seenWooIDs[uint(p.ID)] = struct{}{}
 			rows = append(rows, db.WooProductCache{
 				WooID:             uint(p.ID),
 				TowarID:           nil, // nie znamy jeszcze mapowania z PCM – zostanie uzupełnione później
@@ -81,6 +88,7 @@ func (w *Woo) primeCache(ctx context.Context, gdb *gorm.DB) error {
 				PriceRegular:      parsePrice(p.RegularPrice),
 				PriceSale:         parsePrice(p.SalePrice),
 				HurtPrice:         parsePrice(w.customFieldValue(p, "hurt_price")),
+				TaxClass:          p.TaxClass,
 				StockQty:          p.StockQuantity,
 				StockManaged:      p.ManageStock,
 				StockStatus:       p.StockStatus,
@@ -95,18 +103,59 @@ func (w *Woo) primeCache(ctx context.Context, gdb *gorm.DB) error {
 		if err := gdb.Clauses(clause.OnConflict{
 			Columns: []clause.Column{{Name: "woo_id"}}, // klucz unikalny
 			DoUpdates: clause.AssignmentColumns([]string{
-				"kod", "name", "price_regular", "price_sale", "hurt_price",
+				"kod", "name", "price_regular", "price_sale", "hurt_price", "tax_class",
 				"stock_qty", "stock_managed", "stock_status", "backorders", "catalog_visibility", "status", "ean", "type", "date_modified",
 			}),
 		}).Create(&rows).Error; err != nil {
 			return fmt.Errorf("upsert cache page %d: %w", page, err)
 		}
 
+		if len(items) < perPage {
+			break
+		}
 		page++
 	}
 
-	w.log.Info().Msg("Woo cache primed (products)")
+	removed, err := w.deleteMissingWooCacheProducts(ctx, gdb, seenWooIDs)
+	if err != nil {
+		return fmt.Errorf("remove stale Woo cache products: %w", err)
+	}
+	w.log.Info().Int64("removed", removed).Msg("Woo cache primed (products)")
 	return nil
+}
+
+func (w *Woo) deleteMissingWooCacheProducts(ctx context.Context, gdb *gorm.DB, seen map[uint]struct{}) (int64, error) {
+	var cachedIDs []uint
+	if err := gdb.Model(&db.WooProductCache{}).Pluck("woo_id", &cachedIDs).Error; err != nil {
+		return 0, err
+	}
+
+	stale := make([]uint, 0)
+	for _, wooID := range cachedIDs {
+		if _, ok := seen[wooID]; !ok {
+			stale = append(stale, wooID)
+		}
+	}
+
+	var removed int64
+	// Offset pagination can miss a product while the shop changes. Confirm each
+	// candidate independently and delete only an explicit Woo 404.
+	for _, wooID := range stale {
+		_, err := w.fetchProduct(ctx, wooID)
+		var httpErr *wooHTTPError
+		if err == nil {
+			continue
+		}
+		if !errors.As(err, &httpErr) || httpErr.StatusCode != http.StatusNotFound {
+			return removed, fmt.Errorf("verify cache candidate %d: %w", wooID, err)
+		}
+		res := gdb.Where("woo_id = ?", wooID).Delete(&db.WooProductCache{})
+		if res.Error != nil {
+			return removed, res.Error
+		}
+		removed += res.RowsAffected
+	}
+	return removed, nil
 }
 
 func (w *Woo) runCacheSweeper(ctx context.Context, gdb *gorm.DB) {
@@ -133,13 +182,21 @@ func (w *Woo) runCacheSweeper(ctx context.Context, gdb *gorm.DB) {
 
 func (w *Woo) sweepOnce(ctx context.Context, gdb *gorm.DB) {
 	const kvKey = "woo_cache_last_sweep"
-	last, ok := kvGetTime(gdb, kvKey)
+	last, ok, err := kvGetTime(gdb, kvKey)
+	if err != nil {
+		w.recordFatal(fmt.Errorf("sweep checkpoint read: %w", err))
+		return
+	}
 	if !ok {
 		// pierwszy raz: cofamy się o 24h, żeby nie ciągnąć całego sklepu
 		last = time.Now().UTC().Add(-24 * time.Hour)
 	}
 
-	base, _ := url.Parse(w.cfg.BaseURL)
+	base, err := url.Parse(w.cfg.BaseURL)
+	if err != nil {
+		w.log.Error().Err(err).Msg("sweep: invalid Woo base URL")
+		return
+	}
 	base.Path = "/wp-json/wc/v3/products"
 
 	perPage := 100
@@ -159,6 +216,7 @@ func (w *Woo) sweepOnce(ctx context.Context, gdb *gorm.DB) {
 		q.Set("order", "desc")
 		q.Set("per_page", strconv.Itoa(perPage))
 		q.Set("page", strconv.Itoa(page))
+		q.Set("status", "any")
 		q.Set("_fields", w.productFields())
 		base.RawQuery = q.Encode()
 
@@ -210,7 +268,7 @@ func (w *Woo) sweepOnce(ctx context.Context, gdb *gorm.DB) {
 				newest = tm
 			}
 
-			if !tm.After(last) { // (<= last) → reszta będzie starsza (sort=desc)
+			if tm.Before(last.Add(-2 * time.Second)) {
 				stop = true
 				break
 			}
@@ -224,6 +282,7 @@ func (w *Woo) sweepOnce(ctx context.Context, gdb *gorm.DB) {
 				PriceRegular:      parsePrice(p.RegularPrice),
 				PriceSale:         parsePrice(p.SalePrice),
 				HurtPrice:         parsePrice(w.customFieldValue(p, "hurt_price")),
+				TaxClass:          p.TaxClass,
 				StockQty:          p.StockQuantity,
 				StockManaged:      p.ManageStock,
 				StockStatus:       p.StockStatus,
@@ -239,11 +298,12 @@ func (w *Woo) sweepOnce(ctx context.Context, gdb *gorm.DB) {
 			if err := gdb.Clauses(clause.OnConflict{
 				Columns: []clause.Column{{Name: "woo_id"}},
 				DoUpdates: clause.AssignmentColumns([]string{
-					"kod", "ean", "name", "price_regular", "price_sale", "hurt_price",
+					"kod", "ean", "name", "price_regular", "price_sale", "hurt_price", "tax_class",
 					"stock_qty", "stock_managed", "stock_status", "backorders", "catalog_visibility", "status", "type", "date_modified",
 				}),
 			}).Create(&rows).Error; err != nil {
 				w.log.Error().Err(err).Msg("sweep upsert failed")
+				w.recordFatal(fmt.Errorf("sweep cache upsert: %w", err))
 				return
 			}
 			total += len(rows)
@@ -260,6 +320,8 @@ func (w *Woo) sweepOnce(ctx context.Context, gdb *gorm.DB) {
 	if total > 0 && !newest.IsZero() {
 		if err := kvSetTime(gdb, kvKey, newest); err != nil {
 			w.log.Error().Err(err).Msg("kvSetTime failed")
+			w.recordFatal(fmt.Errorf("sweep checkpoint write: %w", err))
+			return
 		}
 		w.log.Info().Int("upserts", total).Time("since", last).Time("newest", newest).Msg("cache sweep done")
 	} else {
@@ -276,20 +338,20 @@ func parsePrice(s string) float64 {
 	return v
 }
 
-func kvGetTime(gdb *gorm.DB, key string) (time.Time, bool) {
+func kvGetTime(gdb *gorm.DB, key string) (time.Time, bool, error) {
 	var row db.KV
 	res := gdb.Where("k = ?", key).Limit(1).Find(&row)
 	if res.Error != nil {
-		return time.Time{}, false
+		return time.Time{}, false, res.Error
 	}
 	if res.RowsAffected == 0 {
-		return time.Time{}, false
+		return time.Time{}, false, nil
 	}
 	t, err := time.Parse(time.RFC3339, row.V)
 	if err != nil {
-		return time.Time{}, false
+		return time.Time{}, false, fmt.Errorf("invalid %s timestamp %q: %w", key, row.V, err)
 	}
-	return t, true
+	return t, true, nil
 }
 
 func kvSetTime(gdb *gorm.DB, key string, t time.Time) error {

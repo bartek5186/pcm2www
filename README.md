@@ -5,14 +5,14 @@
 Ten plik opisuje integrację systemu **PC-Market 7 (PCM)** poprzez narzędzie **pcm2www** z platformą **WooCommerce**.
 Integrator działa cyklicznie, pobiera dane z katalogu eksportów PC-Market (`exp_wyk_*.xml`) oraz synchronizuje je z WooCommerce przy użyciu REST API.
 
-> **Status implementacji (2026-03-17):** funkcje oznaczone jako **[NIEGOTOWE]** nie są jeszcze ukończone.
+> **Status implementacji (2026-09-04):** funkcje oznaczone jako **[NIEGOTOWE]** nie są jeszcze ukończone.
 
 ## Funkcjonalności
 
-- **Automatyczna synchronizacja** stanów magazynowych, EAN i cen do WooCommerce (aktywna)
+- **Automatyczna synchronizacja** stanów magazynowych, cen i dostępności produktów dopasowanych po EAN (aktywna)
 - **Obsługa cache** – pełne i przyrostowe odświeżanie danych z WooCommerce
 - **Import plików PCM** – aktualnie obsługiwany format: `exp_wyk_*.xml` **[inne typy: NIEGOTOWE]**
-- **Integracja przez REST API** WooCommerce: update stanu, EAN, ceny (aktywne); tworzenie nowych produktów **[NIEGOTOWE]**
+- **Integracja przez REST API** WooCommerce: aktualizacja stanu, ceny i dostępności (aktywne); zmiana EAN i tworzenie nowych produktów są wyłączone
 - **Elastyczna konfiguracja** poprzez plik JSON
 - **Ciągła praca w tle** – monitoring katalogu, kolejka tasków, worker wysyłki do Woo
 
@@ -41,7 +41,7 @@ Plik konfiguracyjny: `~/.config/pcm2www/config.json`
       "cache": {
         "prime_on_start": true,
         "sweep_interval_minutes": 360,
-        "fields": "id,sku,name,regular_price,sale_price,stock_quantity,manage_stock,status,global_unique_id,date_modified_gmt,type"
+        "fields": "id,sku,name,regular_price,sale_price,tax_class,stock_quantity,manage_stock,stock_status,backorders,catalog_visibility,status,global_unique_id,date_modified_gmt,type"
       },
       "custom_fields": [
         {
@@ -56,10 +56,11 @@ Plik konfiguracyjny: `~/.config/pcm2www/config.json`
     "importer": {
       "watch_dir": "~/pcm2www/imports",
       "poll_sec": 5,
-      "price_mode": "gross"
+	  "price_mode": "gross",
+	  "stability_seconds": 2
     }
   },
-  "auto_start": true,
+	"auto_start": false,
   "sync_interval_seconds": 10
 }
 ```
@@ -108,8 +109,12 @@ Przykłady:
 
 ## Parametry globalne
 
-- **auto_start** – integrator startuje automatycznie po uruchomieniu aplikacji.
-- **sync_interval_seconds** – globalny interwał heartbeat syncera, tutaj co **10 sekund**.
+- **auto_start** – określa, czy po uruchomieniu procesu aplikacja ma od razu wystartować wszystkie integracje zapisane w `integrations`. `true` uruchamia importer, cache i workery bez klikania/komendy `start`; `false` uruchamia tylko CLI lub ikonę w trayu i czeka na ręczny start. To ustawienie nie uruchamia programu razem z Windowsem/Linuxem i nie jest harmonogramem importu.
+- **sync_interval_seconds** – interwał wewnętrznego heartbeat syncera. Nie zastępuje `poll_sec` importera ani workera.
+
+### Pierwsze uruchomienie
+
+`LoadOrCreate()` tworzy kompletny szablon z integracjami `woocommerce` i `importer`, ale ustawia `auto_start=false`. Przed pierwszym ręcznym startem trzeba wpisać prawdziwy URL i klucze Woo oraz utworzyć lub wskazać istniejący `watch_dir`. Parser odrzuca nieznane pola JSON, a fabryki integracji odrzucają placeholdery, błędny URL, niedozwolony tryb ceny i niepoprawne interwały. Dopiero po udanym ręcznym starcie warto świadomie zmienić `auto_start` na `true`.
 
 ---
 
@@ -131,15 +136,19 @@ Sekcja `cache` określa sposób buforowania danych produktów z WooCommerce:
   - id, sku – identyfikatory
   - name – nazwa produktu
   - regular_price, sale_price – ceny
+  - tax_class – klasa podatkowa
   - stock_quantity, manage_stock – stany magazynowe
   - stock_status – `instock` / `outofstock` / `onbackorder`
   - backorders – `no` / `notify` / `yes`
+  - catalog_visibility – widoczność w katalogu
   - status – status produktu (np. publish / draft)
   - global_unique_id – pole Woo "GTIN, UPC, EAN, lub ISBN"
   - date_modified_gmt – data ostatniej modyfikacji
   - type – typ produktu (np. simple, variable)
 
-> `stock_status` i `backorders` są zawsze dołączane do zapytań API niezależnie od wartości `fields` w konfiguracji.
+> `stock_status`, `backorders`, `tax_class` i `catalog_visibility` są zawsze dołączane do zapytań API niezależnie od wartości `fields` w konfiguracji.
+
+Po poprawnym zakończeniu pełnego prime kandydat do usunięcia z cache jest jeszcze sprawdzany osobnym `GET /products/{id}`. Lokalny wpis jest usuwany wyłącznie po jednoznacznym HTTP 404; produkt pominięty wskutek przesunięcia paginacji zostaje zachowany. Czyszczenie nie jest wykonywane po niepełnym lub błędnym pobraniu. Sweep używa `status=any` i dwusekundowego nakładania zakresów czasowych, ale jako tryb przyrostowy sam nie wykrywa usunięć.
 
 ### Pola customowe
 
@@ -157,25 +166,32 @@ Worker działa w tle i przetwarza kolejkę zadań atomicznie (claim → execute 
 
 | Kind | Opis | Polityki skip |
 |---|---|---|
-| `ean.update` | Ustawienie EAN produktu w Woo | Skip jeśli produkt już ma jakikolwiek EAN; skip jeśli EAN zajęty przez inny produkt |
-| `stock.update` | Aktualizacja stanu magazynowego | Skip jeśli `cena_detal=0`; skip jeśli `manage_stock=false`; skip jeśli stan już się zgadza; skip jeśli PCM nie zmienił stanu od poprzedniego importu |
-| `price.update` | Aktualizacja ceny regularnej, hurtowej i klasy podatkowej (`tax_class`) | Skip jeśli `cena_detal=0`; skip jeśli aktywna `sale_price > 0`; skip jeśli cena i klasa podatkowa już się zgadzają |
+| `stock.update` | Aktualizacja stanu magazynowego | Skip jeśli `cena_detal=0` lub `do_usuniecia=Y`; skip jeśli `manage_stock=false`; skip jeśli stan już się zgadza; skip jeśli PCM nie zmienił stanu od poprzedniego importu |
+| `price.update` | Aktualizacja ceny regularnej, hurtowej i klasy podatkowej (`tax_class`) | Skip jeśli `cena_detal=0` lub `do_usuniecia=Y`; skip jeśli aktywna `sale_price > 0`; skip jeśli cena i klasa podatkowa już się zgadzają |
 | `availability.update` | Zarządzanie dostępnością produktu w sklepie | Skip jeśli stan w Woo już jest zgodny z oczekiwanym |
 
 `price.update` używa `integrations.importer.price_mode`: domyślne `"gross"` wysyła ceny brutto z PC-Market, a `"net"` przelicza je na netto przed utworzeniem taska.
 
-**Logika dostępności (cena_detal z PCM):**
+**Logika dostępności i flag PCM:**
 
-| cena_detal | Akcja w Woo |
+| Warunek w PCM | Akcja w Woo |
 |---|---|
-| `= 0` | `manage_stock=false` + `stock_status=outofstock` (produkt niedostępny, brak śledzenia) |
-| `> 0` | `manage_stock=true` + `backorders=notify` (śledź stan, zamówienia oczekujące z powiadomieniem) |
+| `do_usuniecia=N`, `cena_detal>0` | produkt aktywny: `manage_stock=true`, `backorders=notify`, `catalog_visibility=visible` |
+| `do_usuniecia=Y` lub `cena_detal=0` | produkt niedostępny: `manage_stock=false`, `stock_status=outofstock`, `catalog_visibility=hidden`; bez aktualizacji ceny i stanu |
+
+Flaga `do_usuniecia` nie usuwa produktu z WooCommerce. Powoduje tylko bezpieczne ukrycie istniejącego produktu dopasowanego po EAN.
+
+`aktywny_w_SI` jest zapisywane w stagingu, ale obecnie nie steruje synchronizacją. W dostępnych eksportach wszystkie 941 wystąpień mają wartość `N`, również dla zwykłych produktów, więc potraktowanie `Y` jako warunku publikacji ukryłoby cały katalog. Flagę można włączyć do polityki dopiero po potwierdzeniu jej znaczenia i ustawień eksportu w PC-Market.
+
+Przy przejściu ceny z `0` na wartość dodatnią task dostępności przywraca również bieżący stan z PCM. Zapobiega to pozostawieniu reaktywowanego produktu ze stanem `0` po wcześniejszym wyłączeniu `manage_stock`.
+
+EAN jest wyłącznie kluczem dopasowania. Synchronizowane są tylko istniejące produkty Woo, których EAN jednoznacznie odpowiada `st_products.kod`. Brak zgodnego EAN oznacza brak linku i brak aktualizacji; aplikacja nie tworzy produktu ani nie wpisuje mu EAN. Stare zadania `ean.update` są kończone jako `skipped` bez wywołania API.
 
 #### Ochrona przed nadpisaniem sprzedaży online
 
 `st_stocks` przechowuje kolumnę `stan_prev` — poprzednią wartość stanu PCM przed ostatnim upsertem (NULL przy pierwszym imporcie produktu). Planner porównuje `stan` z `stan_prev`: jeśli są równe, PCM nie zmienił stanu od ostatniego eksportu, więc różnica w cache Woo prawdopodobnie wynika ze sprzedaży w sklepie — task `stock.update` nie jest generowany. Jeśli PCM zmienił stan (np. pracownik zrobił korektę lub przyjął dostawę), delta ≠ 0 i task jest generowany z wartością absolutną z PCM.
 
-Każdy task jest weryfikowany po aktualizacji (GET po PUT). Nieudane taski są requeue'owane.
+Bezpośrednio przed zapisem worker ponownie sprawdza, czy `woo_id` nadal jest jednoznacznie powiązane z tym samym `towar_id` i EAN. Nieaktualny task dostaje status `superseded` bez wywołania Woo. Każdy zapis jest weryfikowany przez osobny GET — również po zbiorczym POST. Błędy przejściowe (timeout, HTTP 429 i 5xx) są ponawiane z wykładniczym opóźnieniem, jitterem i uwzględnieniem `Retry-After`, maksymalnie do 5 prób. Wspólny circuit breaker wyhamowuje workery podczas awarii sklepu. Błąd zapisu stanu taska do bazy zatrzymuje integrację zamiast udawać powodzenie.
 **Tworzenie nowych produktów w Woo jest [NIEGOTOWE].**
 
 #### Stawki podatkowe
@@ -201,10 +217,23 @@ Sekcja `importer` odpowiada za pobieranie danych z PC-Market:
 
 - **watch_dir** – katalog, w którym PCM umieszcza eksporty. W tej konfiguracji: `~/pcm2www/imports`.
 - **poll_sec** – co ile sekund sprawdzany jest katalog importu, tutaj co **5 sekund**.
+- **stability_seconds** – minimalny czas, przez który rozmiar i data modyfikacji pliku muszą pozostać bez zmian przed importem (domyślnie **2 s**). Dodatkowa kontrola SHA256 wycofuje transakcję, jeśli plik zmieni się już podczas parsowania. Najpewniejszy sposób publikacji eksportu to zapis pod nazwą tymczasową i atomowa zmiana nazwy na `exp_wyk_*.xml` po zakończeniu zapisu.
 
-Aktualnie parsowany format: `exp_wyk_*.xml`. Inne typy eksportów PCM (`exp_dok_*` itp.) są **[NIEGOTOWE]**.
+Aktualnie parsowany format: `exp_wyk_*.xml`. Pliki ZIP nie są obsługiwane i importer je ignoruje. Inne typy eksportów PCM (`exp_dok_*` itp.) są **[NIEGOTOWE]**.
 
-Dedulikacja pliku odbywa się przez SHA256, nazwę pliku i `transmisja_id`. Obsługiwane kodowania: ISO-8859-2, Windows-1250 i inne.
+Deduplikacja pliku odbywa się przez SHA256 zawartości lub niepuste `transmisja_id`. Nazwa pliku jest tylko metadanym: PC-Market może użyć tej samej nazwy dla nowego eksportu i taki plik zostanie przetworzony, jeśli ma inną zawartość i transmisję. Nieudany import może zostać ponowiony z tym samym rekordem `import_files`.
+
+Importer odrzuca powtórzony `towar_id` produktu i klucz stanu `(towar_id, magazyn_id)` wewnątrz jednego XML-a. `towar_id` jest stabilną tożsamością rekordu PCM; `kod`/EAN może się zmienić i wtedy aktualizuje ten sam rekord stagingu. Powiązanie ze sklepem nadal odbywa się wyłącznie po bieżącym EAN. Staging oraz oznaczenie importu jako `done` są zapisywane w jednej transakcji; błąd wycofuje wszystkie zmiany stagingu. Obsługiwane kodowania: ISO-8859-2, Windows-1250 i inne.
+
+Linker wykrywa duplikaty EAN po obu stronach. Powtórzony EAN w PCM tworzy `link_issues.reason=duplicate_ean_source`, powtórzony EAN w Woo tworzy `duplicate_ean_shop`; niejednoznaczny produkt nie jest linkowany ani aktualizowany.
+
+Migracje zapisują wersję w `schema_migrations`, mają minutowy deadline i są idempotentne. Przed zmianą istniejącej bazy SQLite powstaje kopia `pcm2www.db.backup-*` (zostaje pięć ostatnich). Migracja usuwa wyłącznie nadmiarowe duplikaty diagnostyk i starszych rekordów tego samego `towar_id`, zachowując najnowszy, oraz usuwa stare błędne indeksy.
+
+Proces utrzymuje blokadę `pcm2www.lock`, dlatego druga lokalna instancja nie może jednocześnie przejąć tasków. Log `app.log` obraca się po 10 MiB i zachowuje pięć kopii.
+
+## Lokalna walidacja sekwencji XML
+
+Polecenie `./scripts/validate_xml_sequence.sh` kopiuje po kolei wszystkie `imports/incoming_test/exp_wyk_*.xml` do katalogu tymczasowego i importuje je do izolowanej bazy SQLite w pamięci. Nie otwiera ani nie zmienia bazy aplikacji. Po **każdym pojedynczym XML-u** niezależny model referencyjny porównuje pełny stan wszystkich pól `st_products`, `st_stocks` (w tym `stan_prev`) i tożsamość importu. Błąd wskazuje numer kroku, nazwę XML-a oraz produkt lub magazyn, na którym stan się rozszedł.
 
 ---
 
@@ -222,9 +251,9 @@ PC-Market 7
     └─ link_issues (diagnostyki: brak EAN, duplikaty, brak w sklepie)
            ↓
     [Planner] – porównanie staging vs cache, generowanie woo_tasks
-    ├─ ean.update (jeśli EAN produktu niezgodny lub brak w Woo)
     ├─ stock.update (jeśli stan się różni AND PCM zmienił stan od ostatniego importu)
-    └─ price.update (jeśli cena różni się i brak aktywnej promocji)
+    ├─ price.update (jeśli cena różni się i brak aktywnej promocji)
+    └─ availability.update (zmiana dostępności; przy reaktywacji także stan PCM)
            ↓
     [Worker] – claim → fetch → verify → PUT → verify → sync cache
     └─ woo_product_caches (aktualizowany po weryfikacji)
@@ -233,7 +262,7 @@ PC-Market 7
 ```
 
 Cache Woo odświeżany jest niezależnie:
-- pełny paginowany odczyt przy starcie (`prime_on_start=true`),
+- pełny paginowany odczyt i usunięcie nieistniejących wpisów cache przy starcie (`prime_on_start=true`),
 - przyrostowe odświeżanie co `sweep_interval_minutes`.
 
 ---
@@ -249,9 +278,9 @@ Cache Woo odświeżany jest niezależnie:
 | Linkowanie EAN (PCM ↔ Woo) | Działa |
 | Planowanie tasków (planner) | Działa |
 | Worker `stock.update` do Woo | Działa (batch 20) |
-| Worker `ean.update` do Woo | Działa (sekwencyjnie) |
+| Zmiana EAN w Woo | Wyłączona — EAN jest tylko kluczem linkowania |
 | Worker `price.update` do Woo | Działa (batch 20) |
-| Worker `availability.update` do Woo | Działa (sekwencyjnie) |
+| Worker `availability.update` do Woo | Działa (batch 20) |
 | Równoległe workery (`workers` w config) | Działa (domyślnie 3) |
 | Synchronizacja klasy podatkowej (`tax_class`) | Działa |
 | Tworzenie nowych produktów w Woo | NIEGOTOWE |

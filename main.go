@@ -18,6 +18,7 @@ import (
 	conf "github.com/bartek5186/pcm2www/internal/config"
 	"github.com/bartek5186/pcm2www/internal/db"
 	logs "github.com/bartek5186/pcm2www/internal/logs"
+	"github.com/bartek5186/pcm2www/internal/singleinstance"
 	syncer "github.com/bartek5186/pcm2www/internal/syncer"
 	"github.com/getlantern/systray"
 )
@@ -45,6 +46,12 @@ func main() {
 		messageBox("Procyon Syncer — błąd startu", fmt.Sprintf("Nie można utworzyć katalogu:\n%s\n%v", appDir, err))
 		return
 	}
+	instanceLock, err := singleinstance.Acquire(filepath.Join(appDir, "pcm2www.lock"))
+	if err != nil {
+		messageBox("Procyon Syncer — już uruchomiony", err.Error())
+		return
+	}
+	defer instanceLock.Release()
 
 	logFile, err := os.OpenFile(filepath.Join(appDir, "app.log"), os.O_RDWR|os.O_CREATE|os.O_APPEND, 0666)
 	if err != nil {
@@ -155,8 +162,11 @@ func main() {
 						log.Error().Msgf("Błąd reloadu: %v", err)
 						continue
 					}
+					if err := s.UpdateConfig(newCfg); err != nil {
+						log.Error().Err(err).Msg("Błąd zastosowania konfiguracji")
+						continue
+					}
 					cfg = newCfg
-					s.UpdateConfig(cfg)
 					log.Info().Msg("Konfiguracja przeładowana")
 
 				case <-mAbout.ClickedCh:
@@ -178,7 +188,6 @@ func main() {
 		time.Sleep(50 * time.Millisecond)
 	})
 }
-
 
 var (
 	modUser32      = syscall.NewLazyDLL("user32.dll")

@@ -13,15 +13,16 @@
       "cache": {
         "prime_on_start": true,
         "sweep_interval_minutes": 360,
-        "fields": "id,sku,name,regular_price,sale_price,stock_quantity,manage_stock,status,hurt_price,ean,date_modified_gmt,type"
+        "fields": "id,sku,name,regular_price,sale_price,tax_class,stock_quantity,manage_stock,stock_status,backorders,catalog_visibility,status,hurt_price,ean,global_unique_id,date_modified_gmt,type"
       }
     },
     "importer": {
       "watch_dir": "~/pcm2www/imports",
       "poll_sec": 5,
-      "price_mode": "gross"
+	  "price_mode": "gross",
+	  "stability_seconds": 2
     }
   },
-  "auto_start": true,
+	"auto_start": false,
   "sync_interval_seconds": 10
 }

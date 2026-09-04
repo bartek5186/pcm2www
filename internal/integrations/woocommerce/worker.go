@@ -6,14 +6,18 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"math"
+	"net"
 	"net/http"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/bartek5186/pcm2www/internal/db"
+	"github.com/bartek5186/pcm2www/internal/integrations"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 )
@@ -39,24 +43,172 @@ var batchableKinds = []string{db.WooTaskKindPriceUpdate, db.WooTaskKindStockUpda
 
 const workerBatchSize = 20
 
+const maxWooTaskAttempts = 5
+
+type wooHTTPError struct {
+	StatusCode int
+	Body       string
+	RetryAfter time.Duration
+}
+
+func (e *wooHTTPError) Error() string {
+	if strings.TrimSpace(e.Body) == "" {
+		return fmt.Sprintf("http %d", e.StatusCode)
+	}
+	return fmt.Sprintf("http %d: %s", e.StatusCode, e.Body)
+}
+
+func recoverRunningWooTasks(gdb *gorm.DB) (int64, error) {
+	res := gdb.Model(&db.WooTask{}).
+		Where("status = ?", "running").
+		Updates(map[string]any{
+			"status":          "pending",
+			"last_error":      "recovered after interrupted worker",
+			"next_attempt_at": nil,
+			"started_at":      nil,
+			"finished_at":     nil,
+		})
+	return res.RowsAffected, res.Error
+}
+
+func (w *Woo) lockWooProducts(wooIDs []uint) func() {
+	stripes := make([]int, 0, len(wooIDs))
+	seen := make(map[int]struct{}, len(wooIDs))
+	for _, wooID := range wooIDs {
+		stripe := int(wooID % uint(len(w.productLocks)))
+		if _, ok := seen[stripe]; ok {
+			continue
+		}
+		seen[stripe] = struct{}{}
+		stripes = append(stripes, stripe)
+	}
+	sort.Ints(stripes)
+	for _, stripe := range stripes {
+		w.productLocks[stripe].Lock()
+	}
+	return func() {
+		for idx := len(stripes) - 1; idx >= 0; idx-- {
+			w.productLocks[stripes[idx]].Unlock()
+		}
+	}
+}
+
+func (w *Woo) completeIfObsolete(gdb *gorm.DB, task db.WooTask) bool {
+	if task.WooID == nil {
+		return false
+	}
+	var newer int64
+	if err := gdb.Model(&db.WooTask{}).
+		Where("woo_id = ? AND kind = ? AND task_id > ? AND status <> ?", *task.WooID, task.Kind, task.TaskID, "superseded").
+		Count(&newer).Error; err != nil {
+		w.failWooTask(gdb, task, fmt.Errorf("check for newer task: %w", err))
+		return true
+	}
+	if newer == 0 {
+		return false
+	}
+	w.completeWooTask(gdb, task, "superseded", "newer task exists for this product and operation", "")
+	return true
+}
+
+func (w *Woo) completeIfLinkStale(gdb *gorm.DB, task db.WooTask) bool {
+	if task.Kind == db.WooTaskKindEANUpdate {
+		return false
+	}
+	current, reason, err := wooTaskLinkCurrent(gdb, task)
+	if err != nil {
+		w.failWooTask(gdb, task, fmt.Errorf("validate current EAN link: %w", err))
+		return true
+	}
+	if current {
+		return false
+	}
+	w.completeWooTask(gdb, task, "superseded", reason, "")
+	w.log.Warn().Uint("task_id", task.TaskID).Str("reason", reason).Msg("woo worker: stale task superseded")
+	return true
+}
+
+func wooTaskLinkCurrent(gdb *gorm.DB, task db.WooTask) (bool, string, error) {
+	if task.WooID == nil || task.TowarID == nil {
+		return false, "task has no Woo/source identity", nil
+	}
+	var cache db.WooProductCache
+	if err := gdb.Where("woo_id = ?", *task.WooID).Take(&cache).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return false, "Woo product is no longer present in cache", nil
+		}
+		return false, "", err
+	}
+	if cache.TowarID == nil || *cache.TowarID != *task.TowarID {
+		return false, "Woo product is no longer linked to this source product", nil
+	}
+	var products []db.StProduct
+	if err := gdb.Where("towar_id = ?", *task.TowarID).Limit(2).Find(&products).Error; err != nil {
+		return false, "", err
+	}
+	if len(products) != 1 {
+		return false, "source product is missing or ambiguous", nil
+	}
+	sourceEAN := integrations.NormalizeEAN(products[0].Kod)
+	cacheEAN := integrations.NormalizeEAN(cache.Ean)
+	if sourceEAN == "" || cacheEAN == "" || sourceEAN != cacheEAN {
+		return false, "EAN link changed after task was planned", nil
+	}
+	return true, "", nil
+}
+
+func (w *Woo) completeIfLiveEANStale(gdb *gorm.DB, task db.WooTask, product wcProduct) bool {
+	if task.TowarID == nil {
+		w.completeWooTask(gdb, task, "superseded", "task has no source identity", "")
+		return true
+	}
+	var source db.StProduct
+	if err := gdb.Where("towar_id = ?", *task.TowarID).Take(&source).Error; err != nil {
+		w.failWooTask(gdb, task, fmt.Errorf("revalidate source EAN against live Woo product: %w", err))
+		return true
+	}
+	sourceEAN := integrations.NormalizeEAN(source.Kod)
+	liveEAN := integrations.NormalizeEAN(product.cacheEAN())
+	if sourceEAN != "" && sourceEAN == liveEAN {
+		return false
+	}
+	if err := gdb.Model(&db.WooProductCache{}).Where("woo_id = ?", uint(product.ID)).Updates(map[string]any{
+		"ean": product.cacheEAN(), "towar_id": nil,
+	}).Error; err != nil {
+		w.failWooTask(gdb, task, fmt.Errorf("clear cache link after live EAN change: %w", err))
+		return true
+	}
+	w.completeWooTask(gdb, task, "superseded", "live Woo EAN no longer matches source EAN", "")
+	return true
+}
+
 func (w *Woo) workerTick(ctx context.Context, gdb *gorm.DB) {
 	for {
 		if ctx.Err() != nil {
+			return
+		}
+		if delay := w.circuitDelay(); delay > 0 {
+			w.log.Warn().Dur("retry_in", delay).Msg("woo worker: circuit breaker open")
 			return
 		}
 
 		// 1) Spróbuj batch dla każdego batchable kind
 		didBatch := false
 		for _, kind := range batchableKinds {
-			tasks, err := claimNextNWooTasksOfKind(gdb, kind, workerBatchSize)
+			claimCtx, cancelClaim := context.WithTimeout(ctx, 10*time.Second)
+			tasks, err := claimNextNWooTasksOfKind(gdb.WithContext(claimCtx), kind, workerBatchSize)
+			cancelClaim()
 			if err != nil {
 				w.log.Error().Err(err).Str("kind", kind).Msg("woo worker: claim batch failed")
+				w.recordFatal(err)
 				return
 			}
 			if len(tasks) == 0 {
 				continue
 			}
-			w.executeBatch(ctx, gdb, kind, tasks)
+			dbCtx, cancelDB := context.WithTimeout(context.Background(), 30*time.Second)
+			w.executeBatch(ctx, gdb.WithContext(dbCtx), kind, tasks)
+			cancelDB()
 			didBatch = true
 			break
 		}
@@ -64,16 +216,21 @@ func (w *Woo) workerTick(ctx context.Context, gdb *gorm.DB) {
 			continue
 		}
 
-		// 2) Pozostałe typy (ean.update, availability.update) — sekwencyjnie
-		task, err := claimNextSequentialWooTask(gdb)
+		// 2) Pozostałe (w tym stare ean.update) — sekwencyjnie
+		claimCtx, cancelClaim := context.WithTimeout(ctx, 10*time.Second)
+		task, err := claimNextSequentialWooTask(gdb.WithContext(claimCtx))
+		cancelClaim()
 		if err != nil {
 			w.log.Error().Err(err).Msg("woo worker: claim task failed")
+			w.recordFatal(err)
 			return
 		}
 		if task == nil {
 			return
 		}
-		w.executeWooTask(ctx, gdb, *task)
+		dbCtx, cancelDB := context.WithTimeout(context.Background(), 30*time.Second)
+		w.executeWooTask(ctx, gdb.WithContext(dbCtx), *task)
+		cancelDB()
 		if ctx.Err() != nil {
 			return
 		}
@@ -100,7 +257,7 @@ func claimOneWooTaskOfKind(gdb *gorm.DB, kind string) (*db.WooTask, error) {
 	for range 5 {
 		var tasks []db.WooTask
 		if err := gdb.
-			Where("status = ? AND kind = ?", "pending", kind).
+			Where("status = ? AND kind = ? AND (next_attempt_at IS NULL OR next_attempt_at <= ?)", "pending", kind, time.Now()).
 			Order("created_at ASC, task_id ASC").
 			Limit(1).
 			Find(&tasks).Error; err != nil {
@@ -125,7 +282,7 @@ func claimOneWooTaskOfKind(gdb *gorm.DB, kind string) (*db.WooTask, error) {
 func claimNextSequentialWooTask(gdb *gorm.DB) (*db.WooTask, error) {
 	var tasks []db.WooTask
 	if err := gdb.
-		Where("status = ? AND kind NOT IN ?", "pending", batchableKinds).
+		Where("status = ? AND kind NOT IN ? AND (next_attempt_at IS NULL OR next_attempt_at <= ?)", "pending", batchableKinds, time.Now()).
 		Order("created_at ASC, task_id ASC").
 		Limit(1).
 		Find(&tasks).Error; err != nil {
@@ -142,10 +299,11 @@ func claimWooTask(gdb *gorm.DB, task db.WooTask) (*db.WooTask, error) {
 	res := gdb.Model(&db.WooTask{}).
 		Where("task_id = ? AND status = ?", task.TaskID, "pending").
 		Updates(map[string]any{
-			"status":     "running",
-			"started_at": now,
-			"attempts":   gorm.Expr("attempts + 1"),
-			"last_error": "",
+			"status":          "running",
+			"started_at":      now,
+			"attempts":        gorm.Expr("attempts + 1"),
+			"last_error":      "",
+			"next_attempt_at": nil,
 		})
 	if res.Error != nil {
 		return nil, res.Error
@@ -160,6 +318,17 @@ func claimWooTask(gdb *gorm.DB, task db.WooTask) (*db.WooTask, error) {
 }
 
 func (w *Woo) executeWooTask(ctx context.Context, gdb *gorm.DB, task db.WooTask) {
+	if task.WooID != nil {
+		unlock := w.lockWooProducts([]uint{*task.WooID})
+		defer unlock()
+		if w.completeIfObsolete(gdb, task) {
+			return
+		}
+		if w.completeIfLinkStale(gdb, task) {
+			return
+		}
+	}
+
 	w.log.Info().
 		Uint("task_id", task.TaskID).
 		Uint("import_id", task.ImportID).
@@ -170,12 +339,12 @@ func (w *Woo) executeWooTask(ctx context.Context, gdb *gorm.DB, task db.WooTask)
 
 	switch task.Kind {
 	case db.WooTaskKindEANUpdate:
-		var payload db.WooEANUpdatePayload
-		if err := json.Unmarshal([]byte(task.PayloadJSON), &payload); err != nil {
-			w.failWooTask(gdb, task, fmt.Errorf("decode ean payload: %w", err))
-			return
-		}
-		w.handleEANUpdate(ctx, gdb, task, payload)
+		// EAN jest wyłącznie kluczem linkowania PCM ↔ Woo. Nie zmieniamy go
+		// automatycznie; ten przypadek bezpiecznie wygasza stare zadania w bazie.
+		w.completeWooTask(gdb, task, "skipped", "EAN updates disabled: EAN is the link key", "")
+		w.log.Warn().Uint("task_id", task.TaskID).Uint("import_id", task.ImportID).
+			Msg("woo worker: skipped legacy EAN update task")
+		w.logImportBatchStatus(gdb, task.ImportID)
 
 	case db.WooTaskKindStockUpdate:
 		var payload db.WooStockUpdatePayload
@@ -206,109 +375,13 @@ func (w *Woo) executeWooTask(ctx context.Context, gdb *gorm.DB, task db.WooTask)
 	}
 }
 
-func (w *Woo) handleEANUpdate(ctx context.Context, gdb *gorm.DB, task db.WooTask, payload db.WooEANUpdatePayload) {
-	product, err := w.fetchProduct(ctx, payload.WooID)
-	if err != nil {
-		w.failWooTask(gdb, task, fmt.Errorf("fetch live product before ean update: %w", err))
-		return
-	}
-
-	switch {
-	case product.cacheEAN() == payload.DesiredEAN:
-		if err := w.syncCacheFromVerifiedProduct(gdb, product, payload.TowarID); err != nil {
-			w.failWooTask(gdb, task, fmt.Errorf("cache sync after already-set ean: %w", err))
-			return
-		}
-		w.completeWooTask(gdb, task, "done", "", product.cacheEAN())
-		w.log.Info().
-			Uint("task_id", task.TaskID).
-			Uint("import_id", task.ImportID).
-			Uint("woo_id", payload.WooID).
-			Str("ean", payload.DesiredEAN).
-			Msg("woo worker: EAN already set and verified")
-		w.logImportBatchStatus(gdb, task.ImportID)
-		return
-
-	case product.cacheEAN() != "":
-		if err := w.syncCacheFromVerifiedProduct(gdb, product, payload.TowarID); err != nil {
-			w.failWooTask(gdb, task, fmt.Errorf("cache sync after ean policy skip: %w", err))
-			return
-		}
-		msg := fmt.Sprintf("policy skip: product already has live EAN %s", product.cacheEAN())
-		w.completeWooTask(gdb, task, "skipped", msg, product.cacheEAN())
-		w.log.Warn().
-			Uint("task_id", task.TaskID).
-			Uint("import_id", task.ImportID).
-			Uint("woo_id", payload.WooID).
-			Str("live_ean", product.cacheEAN()).
-			Str("desired_ean", payload.DesiredEAN).
-			Msg("woo worker: skip EAN overwrite by policy")
-		w.logImportBatchStatus(gdb, task.ImportID)
-		return
-	}
-
-	var duplicateOwners []uint
-	if err := gdb.Model(&db.WooProductCache{}).
-		Where("woo_id <> ? AND ean = ?", payload.WooID, payload.DesiredEAN).
-		Pluck("woo_id", &duplicateOwners).Error; err != nil {
-		w.failWooTask(gdb, task, fmt.Errorf("check duplicate ean in cache: %w", err))
-		return
-	}
-	if len(duplicateOwners) > 0 {
-		msg := fmt.Sprintf("policy skip: desired EAN already present in cache on Woo IDs %v", duplicateOwners)
-		w.completeWooTask(gdb, task, "skipped", msg, "")
-		w.log.Warn().
-			Uint("task_id", task.TaskID).
-			Uint("import_id", task.ImportID).
-			Uint("woo_id", payload.WooID).
-			Str("desired_ean", payload.DesiredEAN).
-			Interface("owners", duplicateOwners).
-			Msg("woo worker: skip duplicate EAN by policy")
-		w.logImportBatchStatus(gdb, task.ImportID)
-		return
-	}
-
-	verified, err := w.updateAndVerifyProduct(ctx, payload.WooID, map[string]any{
-		"global_unique_id": payload.DesiredEAN,
-	})
-	if err != nil {
-		if strings.Contains(err.Error(), "product_invalid_global_unique_id") {
-			w.completeWooTask(gdb, task, "skipped", err.Error(), "")
-			w.log.Warn().
-				Uint("task_id", task.TaskID).
-				Uint("import_id", task.ImportID).
-				Uint("woo_id", payload.WooID).
-				Str("desired_ean", payload.DesiredEAN).
-				Err(err).
-				Msg("woo worker: EAN rejected by Woo policy")
-			w.logImportBatchStatus(gdb, task.ImportID)
-			return
-		}
-		w.failWooTask(gdb, task, fmt.Errorf("update ean: %w", err))
-		return
-	}
-	if verified.cacheEAN() != payload.DesiredEAN {
-		w.failWooTask(gdb, task, fmt.Errorf("ean verification mismatch: got %q want %q", verified.cacheEAN(), payload.DesiredEAN))
-		return
-	}
-	if err := w.syncCacheFromVerifiedProduct(gdb, verified, payload.TowarID); err != nil {
-		w.failWooTask(gdb, task, fmt.Errorf("cache sync after ean update: %w", err))
-		return
-	}
-	w.completeWooTask(gdb, task, "done", "", verified.cacheEAN())
-	w.log.Info().
-		Uint("task_id", task.TaskID).
-		Uint("import_id", task.ImportID).
-		Uint("woo_id", payload.WooID).
-		Str("verified_ean", verified.cacheEAN()).
-		Msg("woo worker: EAN updated and verified")
-	w.logImportBatchStatus(gdb, task.ImportID)
-}
-
 func (w *Woo) handleStockUpdate(ctx context.Context, gdb *gorm.DB, task db.WooTask, payload db.WooStockUpdatePayload) {
 	product, err := w.fetchProduct(ctx, payload.WooID)
 	if err != nil {
 		w.failWooTask(gdb, task, fmt.Errorf("fetch live product before stock update: %w", err))
+		return
+	}
+	if w.completeIfLiveEANStale(gdb, task, product) {
 		return
 	}
 
@@ -374,6 +447,9 @@ func (w *Woo) handlePriceUpdate(ctx context.Context, gdb *gorm.DB, task db.WooTa
 	product, err := w.fetchProduct(ctx, payload.WooID)
 	if err != nil {
 		w.failWooTask(gdb, task, fmt.Errorf("fetch live product before price update: %w", err))
+		return
+	}
+	if w.completeIfLiveEANStale(gdb, task, product) {
 		return
 	}
 
@@ -451,15 +527,47 @@ func (w *Woo) handlePriceUpdate(ctx context.Context, gdb *gorm.DB, task db.WooTa
 	w.logImportBatchStatus(gdb, task.ImportID)
 }
 
+func availabilityMatches(product wcProduct, payload db.WooAvailabilityPayload) bool {
+	if payload.Unavailable {
+		return !product.ManageStock && product.StockStatus == "outofstock" && product.CatalogVisibility == "hidden"
+	}
+	if !product.ManageStock || product.Backorders != "notify" || product.CatalogVisibility == "hidden" {
+		return false
+	}
+	return !payload.SetStock || floatAlmostEqual(product.StockQuantity, payload.DesiredStock)
+}
+
+func availabilityUpdateBody(payload db.WooAvailabilityPayload) map[string]any {
+	if payload.Unavailable {
+		return map[string]any{
+			"manage_stock":       false,
+			"stock_status":       "outofstock",
+			"catalog_visibility": "hidden",
+		}
+	}
+	body := map[string]any{
+		"manage_stock":       true,
+		"backorders":         "notify",
+		"catalog_visibility": "visible",
+	}
+	if payload.SetStock {
+		body["stock_quantity"] = payload.DesiredStock
+	}
+	return body
+}
+
 func (w *Woo) handleAvailabilityUpdate(ctx context.Context, gdb *gorm.DB, task db.WooTask, payload db.WooAvailabilityPayload) {
 	product, err := w.fetchProduct(ctx, payload.WooID)
 	if err != nil {
 		w.failWooTask(gdb, task, fmt.Errorf("fetch live product before availability update: %w", err))
 		return
 	}
+	if w.completeIfLiveEANStale(gdb, task, product) {
+		return
+	}
 
 	if payload.Unavailable {
-		if !product.ManageStock && product.StockStatus == "outofstock" && product.CatalogVisibility == "hidden" {
+		if availabilityMatches(product, payload) {
 			if err := w.syncCacheFromVerifiedProduct(gdb, product, payload.TowarID); err != nil {
 				w.failWooTask(gdb, task, fmt.Errorf("cache sync after already-set unavailable: %w", err))
 				return
@@ -470,16 +578,12 @@ func (w *Woo) handleAvailabilityUpdate(ctx context.Context, gdb *gorm.DB, task d
 			w.logImportBatchStatus(gdb, task.ImportID)
 			return
 		}
-		verified, err := w.updateAndVerifyProduct(ctx, payload.WooID, map[string]any{
-			"manage_stock":       false,
-			"stock_status":       "outofstock",
-			"catalog_visibility": "hidden",
-		})
+		verified, err := w.updateAndVerifyProduct(ctx, payload.WooID, availabilityUpdateBody(payload))
 		if err != nil {
 			w.failWooTask(gdb, task, fmt.Errorf("update availability (unavailable): %w", err))
 			return
 		}
-		if verified.ManageStock || verified.StockStatus != "outofstock" || verified.CatalogVisibility != "hidden" {
+		if !availabilityMatches(verified, payload) {
 			w.failWooTask(gdb, task, fmt.Errorf("availability verification mismatch: got manage_stock=%v stock_status=%q catalog_visibility=%q", verified.ManageStock, verified.StockStatus, verified.CatalogVisibility))
 			return
 		}
@@ -495,7 +599,7 @@ func (w *Woo) handleAvailabilityUpdate(ctx context.Context, gdb *gorm.DB, task d
 	}
 
 	// available: manage_stock=true, backorders=notify, catalog_visibility=visible
-	if product.ManageStock && product.Backorders == "notify" && product.CatalogVisibility != "hidden" {
+	if availabilityMatches(product, payload) {
 		if err := w.syncCacheFromVerifiedProduct(gdb, product, payload.TowarID); err != nil {
 			w.failWooTask(gdb, task, fmt.Errorf("cache sync after already-set available: %w", err))
 			return
@@ -506,17 +610,13 @@ func (w *Woo) handleAvailabilityUpdate(ctx context.Context, gdb *gorm.DB, task d
 		w.logImportBatchStatus(gdb, task.ImportID)
 		return
 	}
-	verified, err := w.updateAndVerifyProduct(ctx, payload.WooID, map[string]any{
-		"manage_stock":       true,
-		"backorders":         "notify",
-		"catalog_visibility": "visible",
-	})
+	verified, err := w.updateAndVerifyProduct(ctx, payload.WooID, availabilityUpdateBody(payload))
 	if err != nil {
 		w.failWooTask(gdb, task, fmt.Errorf("update availability (available): %w", err))
 		return
 	}
-	if !verified.ManageStock || verified.Backorders != "notify" {
-		w.failWooTask(gdb, task, fmt.Errorf("availability verification mismatch: got manage_stock=%v backorders=%q", verified.ManageStock, verified.Backorders))
+	if !availabilityMatches(verified, payload) {
+		w.failWooTask(gdb, task, fmt.Errorf("availability verification mismatch: got manage_stock=%v backorders=%q stock=%v", verified.ManageStock, verified.Backorders, verified.StockQuantity))
 		return
 	}
 	if err := w.syncCacheFromVerifiedProduct(gdb, verified, payload.TowarID); err != nil {
@@ -553,13 +653,15 @@ func (w *Woo) fetchProduct(ctx context.Context, wooID uint) (wcProduct, error) {
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return wcProduct{}, fmt.Errorf("http %d", resp.StatusCode)
+		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 16<<10))
+		return wcProduct{}, wooErrorFromResponse(resp, raw)
 	}
 
 	var product wcProduct
 	if err := json.NewDecoder(resp.Body).Decode(&product); err != nil {
 		return wcProduct{}, err
 	}
+	w.recordWooSuccess()
 	return product, nil
 }
 
@@ -589,13 +691,8 @@ func (w *Woo) updateAndVerifyProduct(ctx context.Context, wooID uint, body map[s
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		var payload map[string]any
-		if err := json.NewDecoder(resp.Body).Decode(&payload); err == nil {
-			if raw, marshalErr := json.Marshal(payload); marshalErr == nil {
-				return wcProduct{}, fmt.Errorf("http %d: %s", resp.StatusCode, string(raw))
-			}
-		}
-		return wcProduct{}, fmt.Errorf("http %d", resp.StatusCode)
+		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 16<<10))
+		return wcProduct{}, wooErrorFromResponse(resp, raw)
 	}
 
 	return w.fetchProduct(ctx, wooID)
@@ -603,16 +700,16 @@ func (w *Woo) updateAndVerifyProduct(ctx context.Context, wooID uint, body map[s
 
 func (w *Woo) syncCacheFromVerifiedProduct(gdb *gorm.DB, product wcProduct, towarID int64) error {
 	row := db.WooProductCache{
-		WooID:        uint(product.ID),
-		TowarID:      ptrInt64(towarID),
-		Kod:          product.SKU,
-		Ean:          product.cacheEAN(),
-		Name:         product.Name,
-		PriceRegular: parsePrice(product.RegularPrice),
-		PriceSale:    parsePrice(product.SalePrice),
-		HurtPrice:    parsePrice(w.customFieldValue(product, "hurt_price")),
-		TaxClass:     product.TaxClass,
-		StockQty:     product.StockQuantity,
+		WooID:             uint(product.ID),
+		TowarID:           ptrInt64(towarID),
+		Kod:               product.SKU,
+		Ean:               product.cacheEAN(),
+		Name:              product.Name,
+		PriceRegular:      parsePrice(product.RegularPrice),
+		PriceSale:         parsePrice(product.SalePrice),
+		HurtPrice:         parsePrice(w.customFieldValue(product, "hurt_price")),
+		TaxClass:          product.TaxClass,
+		StockQty:          product.StockQuantity,
 		StockManaged:      product.ManageStock,
 		StockStatus:       product.StockStatus,
 		Backorders:        product.Backorders,
@@ -632,20 +729,27 @@ func (w *Woo) syncCacheFromVerifiedProduct(gdb *gorm.DB, product wcProduct, towa
 }
 
 func (w *Woo) failWooTask(gdb *gorm.DB, task db.WooTask, err error) {
-	if isWorkerContextInterruption(err) {
+	if errors.Is(err, context.Canceled) {
 		w.requeueWooTask(gdb, task, err)
+		return
+	}
+	if isTransientWooError(err) && task.Attempts < maxWooTaskAttempts {
+		w.retryWooTask(gdb, task, err)
 		return
 	}
 
 	msg := err.Error()
 	now := time.Now()
-	_ = gdb.Model(&db.WooTask{}).
+	if updateErr := gdb.Model(&db.WooTask{}).
 		Where("task_id = ?", task.TaskID).
 		Updates(map[string]any{
-			"status":      "error",
-			"last_error":  msg,
-			"finished_at": now,
-		}).Error
+			"status":          "error",
+			"last_error":      msg,
+			"next_attempt_at": nil,
+			"finished_at":     now,
+		}).Error; updateErr != nil {
+		w.recordFatal(fmt.Errorf("persist failed task %d: %w", task.TaskID, updateErr))
+	}
 	w.log.Error().
 		Err(err).
 		Uint("task_id", task.TaskID).
@@ -655,15 +759,40 @@ func (w *Woo) failWooTask(gdb *gorm.DB, task db.WooTask, err error) {
 	w.logImportBatchStatus(gdb, task.ImportID)
 }
 
-func (w *Woo) requeueWooTask(gdb *gorm.DB, task db.WooTask, err error) {
-	_ = gdb.Model(&db.WooTask{}).
+func (w *Woo) retryWooTask(gdb *gorm.DB, task db.WooTask, err error) {
+	w.recordTransientWooFailure()
+	nextAttempt := time.Now().Add(wooRetryDelayForError(task, err))
+	if updateErr := gdb.Model(&db.WooTask{}).
 		Where("task_id = ?", task.TaskID).
 		Updates(map[string]any{
-			"status":      "pending",
-			"last_error":  "",
-			"started_at":  nil,
-			"finished_at": nil,
-		}).Error
+			"status":          "pending",
+			"last_error":      err.Error(),
+			"next_attempt_at": nextAttempt,
+			"started_at":      nil,
+			"finished_at":     nil,
+		}).Error; updateErr != nil {
+		w.recordFatal(fmt.Errorf("persist retry task %d: %w", task.TaskID, updateErr))
+	}
+	w.log.Warn().
+		Err(err).
+		Uint("task_id", task.TaskID).
+		Int("attempt", task.Attempts).
+		Time("next_attempt_at", nextAttempt).
+		Msg("woo worker: transient failure, retry scheduled")
+}
+
+func (w *Woo) requeueWooTask(gdb *gorm.DB, task db.WooTask, err error) {
+	if updateErr := gdb.Model(&db.WooTask{}).
+		Where("task_id = ?", task.TaskID).
+		Updates(map[string]any{
+			"status":          "pending",
+			"last_error":      "",
+			"next_attempt_at": nil,
+			"started_at":      nil,
+			"finished_at":     nil,
+		}).Error; updateErr != nil {
+		w.recordFatal(fmt.Errorf("persist requeued task %d: %w", task.TaskID, updateErr))
+	}
 	w.log.Warn().
 		Err(err).
 		Uint("task_id", task.TaskID).
@@ -679,13 +808,16 @@ func (w *Woo) completeWooTask(gdb *gorm.DB, task db.WooTask, status, detail, res
 	if status == "done" {
 		lastError = ""
 	}
-	_ = gdb.Model(&db.WooTask{}).
+	if updateErr := gdb.Model(&db.WooTask{}).
 		Where("task_id = ?", task.TaskID).
 		Updates(map[string]any{
-			"status":      status,
-			"last_error":  lastError,
-			"finished_at": now,
-		}).Error
+			"status":          status,
+			"last_error":      lastError,
+			"next_attempt_at": nil,
+			"finished_at":     now,
+		}).Error; updateErr != nil {
+		w.recordFatal(fmt.Errorf("persist completed task %d: %w", task.TaskID, updateErr))
+	}
 }
 
 func (w *Woo) logImportBatchStatus(gdb *gorm.DB, importID uint) {
@@ -694,7 +826,9 @@ func (w *Woo) logImportBatchStatus(gdb *gorm.DB, importID uint) {
 	}
 
 	var filename string
-	_ = gdb.Model(&db.ImportFile{}).Where("import_id = ?", importID).Select("filename").Scan(&filename).Error
+	if err := gdb.Model(&db.ImportFile{}).Where("import_id = ?", importID).Select("filename").Scan(&filename).Error; err != nil {
+		w.log.Error().Err(err).Uint("import_id", importID).Msg("woo worker: import filename query failed")
+	}
 
 	var rows []struct {
 		Status string
@@ -740,8 +874,89 @@ func floatAlmostEqual(a, b float64) bool {
 	return math.Abs(a-b) < 0.0001
 }
 
-func isWorkerContextInterruption(err error) bool {
-	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
+func isTransientWooError(err error) bool {
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	var httpErr *wooHTTPError
+	if errors.As(err, &httpErr) {
+		return httpErr.StatusCode == http.StatusTooManyRequests || httpErr.StatusCode >= http.StatusInternalServerError
+	}
+	var netErr net.Error
+	return errors.As(err, &netErr) && netErr.Timeout()
+}
+
+func wooRetryDelay(attempt int) time.Duration {
+	if attempt < 1 {
+		attempt = 1
+	}
+	delay := 5 * time.Second
+	for n := 1; n < attempt && delay < 5*time.Minute; n++ {
+		delay *= 2
+	}
+	if delay > 5*time.Minute {
+		return 5 * time.Minute
+	}
+	return delay
+}
+
+func wooRetryDelayForError(task db.WooTask, err error) time.Duration {
+	delay := wooRetryDelay(task.Attempts)
+	jitterPermille := (uint64(task.TaskID)*1103515245 + uint64(task.Attempts)*12345) % 201
+	delay += time.Duration(int64(delay) * int64(jitterPermille) / 1000)
+	var httpErr *wooHTTPError
+	if errors.As(err, &httpErr) && httpErr.RetryAfter > delay {
+		delay = httpErr.RetryAfter
+	}
+	return delay
+}
+
+func wooErrorFromResponse(resp *http.Response, body []byte) *wooHTTPError {
+	return &wooHTTPError{
+		StatusCode: resp.StatusCode,
+		Body:       strings.TrimSpace(string(body)),
+		RetryAfter: parseRetryAfter(resp.Header.Get("Retry-After"), time.Now()),
+	}
+}
+
+func parseRetryAfter(value string, now time.Time) time.Duration {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return 0
+	}
+	if seconds, err := strconv.Atoi(value); err == nil && seconds > 0 {
+		return time.Duration(seconds) * time.Second
+	}
+	if at, err := http.ParseTime(value); err == nil && at.After(now) {
+		return at.Sub(now)
+	}
+	return 0
+}
+
+func (w *Woo) recordTransientWooFailure() {
+	w.circuitMu.Lock()
+	defer w.circuitMu.Unlock()
+	w.circuitFails++
+	if w.circuitFails >= 3 {
+		w.circuitUntil = time.Now().Add(30 * time.Second)
+	}
+}
+
+func (w *Woo) recordWooSuccess() {
+	w.circuitMu.Lock()
+	w.circuitFails = 0
+	w.circuitUntil = time.Time{}
+	w.circuitMu.Unlock()
+}
+
+func (w *Woo) circuitDelay() time.Duration {
+	w.circuitMu.Lock()
+	defer w.circuitMu.Unlock()
+	remaining := time.Until(w.circuitUntil)
+	if remaining <= 0 {
+		return 0
+	}
+	return remaining
 }
 
 func ptrInt64(v int64) *int64 {
@@ -750,6 +965,26 @@ func ptrInt64(v int64) *int64 {
 
 // executeBatch przekazuje grupę tasków do właściwego batch handlera.
 func (w *Woo) executeBatch(ctx context.Context, gdb *gorm.DB, kind string, tasks []db.WooTask) {
+	wooIDs := make([]uint, 0, len(tasks))
+	for _, task := range tasks {
+		if task.WooID != nil {
+			wooIDs = append(wooIDs, *task.WooID)
+		}
+	}
+	unlock := w.lockWooProducts(wooIDs)
+	defer unlock()
+
+	active := tasks[:0]
+	for _, task := range tasks {
+		if !w.completeIfObsolete(gdb, task) && !w.completeIfLinkStale(gdb, task) {
+			active = append(active, task)
+		}
+	}
+	if len(active) == 0 {
+		return
+	}
+	tasks = active
+
 	switch kind {
 	case db.WooTaskKindPriceUpdate:
 		w.handlePriceUpdateBatch(ctx, gdb, tasks)
@@ -806,14 +1041,23 @@ func (w *Woo) handlePriceUpdateBatch(ctx context.Context, gdb *gorm.DB, tasks []
 			w.failWooTask(gdb, e.task, fmt.Errorf("product %d missing in batch GET response", e.payload.WooID))
 			continue
 		}
+		if w.completeIfLiveEANStale(gdb, e.task, product) {
+			continue
+		}
 		switch {
 		case parsePrice(product.SalePrice) > 0:
-			_ = w.syncCacheFromVerifiedProduct(gdb, product, e.payload.TowarID)
+			if err := w.syncCacheFromVerifiedProduct(gdb, product, e.payload.TowarID); err != nil {
+				w.failWooTask(gdb, e.task, fmt.Errorf("cache sync after price policy skip: %w", err))
+				continue
+			}
 			w.completeWooTask(gdb, e.task, "skipped", fmt.Sprintf("policy skip: live sale_price=%v", product.SalePrice), "")
 		case floatAlmostEqual(parsePrice(product.RegularPrice), e.payload.DesiredRegular) &&
 			floatAlmostEqual(parsePrice(w.customFieldValue(product, "hurt_price")), e.payload.DesiredHurt) &&
 			product.TaxClass == e.payload.DesiredTaxClass:
-			_ = w.syncCacheFromVerifiedProduct(gdb, product, e.payload.TowarID)
+			if err := w.syncCacheFromVerifiedProduct(gdb, product, e.payload.TowarID); err != nil {
+				w.failWooTask(gdb, e.task, fmt.Errorf("cache sync after price verification: %w", err))
+				continue
+			}
 			w.completeWooTask(gdb, e.task, "done", "", "")
 		default:
 			upd := map[string]any{
@@ -836,13 +1080,21 @@ func (w *Woo) handlePriceUpdateBatch(ctx context.Context, gdb *gorm.DB, tasks []
 	for i, p := range toUpdate {
 		updates[i] = p.update
 	}
-	verified, err := w.batchUpdateProducts(ctx, updates)
+	_, err = w.batchUpdateProducts(ctx, updates)
 	if err != nil {
 		for _, p := range toUpdate {
 			w.failWooTask(gdb, p.entry.task, fmt.Errorf("batch POST: %w", err))
 		}
 		return
 	}
+	verifiedByID, err := w.fetchProductsBatch(ctx, wooIDsFromUpdates(updates))
+	if err != nil {
+		for _, p := range toUpdate {
+			w.failWooTask(gdb, p.entry.task, fmt.Errorf("batch verification GET: %w", err))
+		}
+		return
+	}
+	verified := productMapValues(verifiedByID)
 
 	// 5. Weryfikacja i sync cache
 	verifiedIDs := make(map[uint]struct{}, len(verified))
@@ -862,7 +1114,10 @@ func (w *Woo) handlePriceUpdateBatch(ctx context.Context, gdb *gorm.DB, tasks []
 			))
 			continue
 		}
-		_ = w.syncCacheFromVerifiedProduct(gdb, prod, e.payload.TowarID)
+		if err := w.syncCacheFromVerifiedProduct(gdb, prod, e.payload.TowarID); err != nil {
+			w.failWooTask(gdb, e.task, fmt.Errorf("cache sync after price update: %w", err))
+			continue
+		}
 		w.completeWooTask(gdb, e.task, "done", "", "")
 	}
 	// Taski których Woo nie zwróciło w odpowiedzi → fail
@@ -920,12 +1175,21 @@ func (w *Woo) handleStockUpdateBatch(ctx context.Context, gdb *gorm.DB, tasks []
 			w.failWooTask(gdb, e.task, fmt.Errorf("product %d missing in batch GET response", e.payload.WooID))
 			continue
 		}
+		if w.completeIfLiveEANStale(gdb, e.task, product) {
+			continue
+		}
 		switch {
 		case !product.ManageStock:
-			_ = w.syncCacheFromVerifiedProduct(gdb, product, e.payload.TowarID)
+			if err := w.syncCacheFromVerifiedProduct(gdb, product, e.payload.TowarID); err != nil {
+				w.failWooTask(gdb, e.task, fmt.Errorf("cache sync after stock policy skip: %w", err))
+				continue
+			}
 			w.completeWooTask(gdb, e.task, "skipped", "policy skip: live product has manage_stock=false", "")
 		case floatAlmostEqual(product.StockQuantity, e.payload.DesiredStock):
-			_ = w.syncCacheFromVerifiedProduct(gdb, product, e.payload.TowarID)
+			if err := w.syncCacheFromVerifiedProduct(gdb, product, e.payload.TowarID); err != nil {
+				w.failWooTask(gdb, e.task, fmt.Errorf("cache sync after stock verification: %w", err))
+				continue
+			}
 			w.completeWooTask(gdb, e.task, "done", "", "")
 		default:
 			toUpdate = append(toUpdate, pending{e, map[string]any{
@@ -945,13 +1209,21 @@ func (w *Woo) handleStockUpdateBatch(ctx context.Context, gdb *gorm.DB, tasks []
 	for i, p := range toUpdate {
 		updates[i] = p.update
 	}
-	verified, err := w.batchUpdateProducts(ctx, updates)
+	_, err = w.batchUpdateProducts(ctx, updates)
 	if err != nil {
 		for _, p := range toUpdate {
 			w.failWooTask(gdb, p.entry.task, fmt.Errorf("batch POST: %w", err))
 		}
 		return
 	}
+	verifiedByID, err := w.fetchProductsBatch(ctx, wooIDsFromUpdates(updates))
+	if err != nil {
+		for _, p := range toUpdate {
+			w.failWooTask(gdb, p.entry.task, fmt.Errorf("batch verification GET: %w", err))
+		}
+		return
+	}
+	verified := productMapValues(verifiedByID)
 
 	// 5. Weryfikacja i sync cache
 	verifiedIDs := make(map[uint]struct{}, len(verified))
@@ -965,7 +1237,10 @@ func (w *Woo) handleStockUpdateBatch(ctx context.Context, gdb *gorm.DB, tasks []
 			w.failWooTask(gdb, e.task, fmt.Errorf("stock verification mismatch: got %v want %v", prod.StockQuantity, e.payload.DesiredStock))
 			continue
 		}
-		_ = w.syncCacheFromVerifiedProduct(gdb, prod, e.payload.TowarID)
+		if err := w.syncCacheFromVerifiedProduct(gdb, prod, e.payload.TowarID); err != nil {
+			w.failWooTask(gdb, e.task, fmt.Errorf("cache sync after stock update: %w", err))
+			continue
+		}
 		w.completeWooTask(gdb, e.task, "done", "", "")
 	}
 	for _, p := range toUpdate {
@@ -1019,23 +1294,19 @@ func (w *Woo) handleAvailabilityUpdateBatch(ctx context.Context, gdb *gorm.DB, t
 			w.failWooTask(gdb, e.task, fmt.Errorf("product %d missing in batch GET response", e.payload.WooID))
 			continue
 		}
-		alreadySet := func() bool {
-			if e.payload.Unavailable {
-				return !product.ManageStock && product.StockStatus == "outofstock" && product.CatalogVisibility == "hidden"
+		if w.completeIfLiveEANStale(gdb, e.task, product) {
+			continue
+		}
+		if availabilityMatches(product, e.payload) {
+			if err := w.syncCacheFromVerifiedProduct(gdb, product, e.payload.TowarID); err != nil {
+				w.failWooTask(gdb, e.task, fmt.Errorf("cache sync after availability verification: %w", err))
+				continue
 			}
-			return product.ManageStock && product.Backorders == "notify" && product.CatalogVisibility != "hidden"
-		}()
-		if alreadySet {
-			_ = w.syncCacheFromVerifiedProduct(gdb, product, e.payload.TowarID)
 			w.completeWooTask(gdb, e.task, "done", "", "")
 			continue
 		}
-		var upd map[string]any
-		if e.payload.Unavailable {
-			upd = map[string]any{"id": e.payload.WooID, "manage_stock": false, "stock_status": "outofstock", "catalog_visibility": "hidden"}
-		} else {
-			upd = map[string]any{"id": e.payload.WooID, "manage_stock": true, "backorders": "notify", "catalog_visibility": "visible"}
-		}
+		upd := availabilityUpdateBody(e.payload)
+		upd["id"] = e.payload.WooID
 		toUpdate = append(toUpdate, pending{e, upd})
 		byWooID[e.payload.WooID] = e
 	}
@@ -1048,13 +1319,21 @@ func (w *Woo) handleAvailabilityUpdateBatch(ctx context.Context, gdb *gorm.DB, t
 	for i, p := range toUpdate {
 		updates[i] = p.update
 	}
-	verified, err := w.batchUpdateProducts(ctx, updates)
+	_, err = w.batchUpdateProducts(ctx, updates)
 	if err != nil {
 		for _, p := range toUpdate {
 			w.failWooTask(gdb, p.entry.task, fmt.Errorf("batch POST: %w", err))
 		}
 		return
 	}
+	verifiedByID, err := w.fetchProductsBatch(ctx, wooIDsFromUpdates(updates))
+	if err != nil {
+		for _, p := range toUpdate {
+			w.failWooTask(gdb, p.entry.task, fmt.Errorf("batch verification GET: %w", err))
+		}
+		return
+	}
+	verified := productMapValues(verifiedByID)
 
 	verifiedIDs := make(map[uint]struct{}, len(verified))
 	for _, prod := range verified {
@@ -1063,17 +1342,14 @@ func (w *Woo) handleAvailabilityUpdateBatch(ctx context.Context, gdb *gorm.DB, t
 			continue
 		}
 		verifiedIDs[uint(prod.ID)] = struct{}{}
-		ok = func() bool {
-			if e.payload.Unavailable {
-				return !prod.ManageStock && prod.StockStatus == "outofstock" && prod.CatalogVisibility == "hidden"
-			}
-			return prod.ManageStock && prod.Backorders == "notify"
-		}()
-		if !ok {
+		if !availabilityMatches(prod, e.payload) {
 			w.failWooTask(gdb, e.task, fmt.Errorf("availability verification mismatch: manage_stock=%v stock_status=%q backorders=%q catalog_visibility=%q", prod.ManageStock, prod.StockStatus, prod.Backorders, prod.CatalogVisibility))
 			continue
 		}
-		_ = w.syncCacheFromVerifiedProduct(gdb, prod, e.payload.TowarID)
+		if err := w.syncCacheFromVerifiedProduct(gdb, prod, e.payload.TowarID); err != nil {
+			w.failWooTask(gdb, e.task, fmt.Errorf("cache sync after availability update: %w", err))
+			continue
+		}
 		w.completeWooTask(gdb, e.task, "done", "", "")
 	}
 	for _, p := range toUpdate {
@@ -1082,6 +1358,34 @@ func (w *Woo) handleAvailabilityUpdateBatch(ctx context.Context, gdb *gorm.DB, t
 		}
 	}
 	w.logImportBatchStatus(gdb, tasks[0].ImportID)
+}
+
+func wooIDsFromUpdates(updates []map[string]any) []uint {
+	ids := make([]uint, 0, len(updates))
+	for _, update := range updates {
+		switch id := update["id"].(type) {
+		case uint:
+			ids = append(ids, id)
+		case int:
+			if id > 0 {
+				ids = append(ids, uint(id))
+			}
+		}
+	}
+	return ids
+}
+
+func productMapValues(products map[uint]wcProduct) []wcProduct {
+	ids := make([]int, 0, len(products))
+	for id := range products {
+		ids = append(ids, int(id))
+	}
+	sort.Ints(ids)
+	result := make([]wcProduct, 0, len(ids))
+	for _, id := range ids {
+		result = append(result, products[uint(id)])
+	}
+	return result
 }
 
 // fetchProductsBatch pobiera wiele produktów jednym GET (?include=id1,id2,...).
@@ -1117,7 +1421,8 @@ func (w *Woo) fetchProductsBatch(ctx context.Context, wooIDs []uint) (map[uint]w
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("batch GET http %d", resp.StatusCode)
+		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 16<<10))
+		return nil, wooErrorFromResponse(resp, raw)
 	}
 
 	var products []wcProduct
@@ -1128,6 +1433,7 @@ func (w *Woo) fetchProductsBatch(ctx context.Context, wooIDs []uint) (map[uint]w
 	for _, p := range products {
 		result[uint(p.ID)] = p
 	}
+	w.recordWooSuccess()
 	return result, nil
 }
 
@@ -1164,18 +1470,14 @@ func (w *Woo) batchUpdateProducts(ctx context.Context, updates []map[string]any)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		var payload map[string]any
-		if err := json.NewDecoder(resp.Body).Decode(&payload); err == nil {
-			if raw, merr := json.Marshal(payload); merr == nil {
-				return nil, fmt.Errorf("batch POST http %d: %s", resp.StatusCode, string(raw))
-			}
-		}
-		return nil, fmt.Errorf("batch POST http %d", resp.StatusCode)
+		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 16<<10))
+		return nil, wooErrorFromResponse(resp, raw)
 	}
 
 	var batchResp wcBatchResponse
 	if err := json.NewDecoder(resp.Body).Decode(&batchResp); err != nil {
 		return nil, err
 	}
+	w.recordWooSuccess()
 	return batchResp.Update, nil
 }

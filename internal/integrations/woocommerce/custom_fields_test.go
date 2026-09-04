@@ -15,7 +15,7 @@ func TestEnsureProductFieldsIncludesConfiguredCustomFields(t *testing.T) {
 		},
 	})
 
-	for _, want := range []string{"promo_price", "meta_data", "regular_price", "global_unique_id"} {
+	for _, want := range []string{"promo_price", "meta_data", "regular_price", "global_unique_id", "tax_class", "catalog_visibility"} {
 		if !strings.Contains(fields, want) {
 			t.Fatalf("expected %q in fields %q", want, fields)
 		}

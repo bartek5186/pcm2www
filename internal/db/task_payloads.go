@@ -7,6 +7,8 @@ const (
 	WooTaskKindAvailabilityUpdate = "availability.update"
 )
 
+// WooEANUpdatePayload istnieje wyłącznie do odczytu historycznych rekordów.
+// Planner nie tworzy takich zadań, a worker kończy je bez wywołania API.
 type WooEANUpdatePayload struct {
 	ImportID    uint   `json:"import_id"`
 	WooID       uint   `json:"woo_id"`
@@ -35,12 +37,14 @@ type WooStockUpdatePayload struct {
 // Unavailable=true (cena_detal=0): manage_stock=false, stock_status=outofstock.
 // Unavailable=false (cena_detal>0): manage_stock=true, backorders=notify.
 type WooAvailabilityPayload struct {
-	ImportID    uint   `json:"import_id"`
-	WooID       uint   `json:"woo_id"`
-	TowarID     int64  `json:"towar_id"`
-	SKU         string `json:"sku"`
-	ProductName string `json:"product_name"`
-	Unavailable bool   `json:"unavailable"`
+	ImportID     uint    `json:"import_id"`
+	WooID        uint    `json:"woo_id"`
+	TowarID      int64   `json:"towar_id"`
+	SKU          string  `json:"sku"`
+	ProductName  string  `json:"product_name"`
+	Unavailable  bool    `json:"unavailable"`
+	SetStock     bool    `json:"set_stock,omitempty"`
+	DesiredStock float64 `json:"desired_stock,omitempty"`
 }
 
 type WooPriceUpdatePayload struct {

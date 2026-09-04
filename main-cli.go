@@ -16,6 +16,7 @@ import (
 	conf "github.com/bartek5186/pcm2www/internal/config"
 	"github.com/bartek5186/pcm2www/internal/db"
 	logs "github.com/bartek5186/pcm2www/internal/logs"
+	"github.com/bartek5186/pcm2www/internal/singleinstance"
 	syncer "github.com/bartek5186/pcm2www/internal/syncer"
 	"gorm.io/gorm"
 )
@@ -24,6 +25,12 @@ var ver = "1.0.0"
 
 func main() {
 	appDir := mustAppDataDir("pcm2www")
+	instanceLock, err := singleinstance.Acquire(filepath.Join(appDir, "pcm2www.lock"))
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return
+	}
+	defer instanceLock.Release()
 	log := logs.New(filepath.Join(appDir, "app.log"), true)
 
 	cfgPath := filepath.Join(appDir, "config.json")
@@ -68,12 +75,17 @@ func main() {
 
 	// Prosta pętla poleceń w terminalu
 	fmt.Println("PCM2WWW CLI", ver)
-	fmt.Println("Komendy: start | stop | reload | status | paths | resetdb! | quit")
+	fmt.Println("Komendy: start | stop | reload | status | retry-errors | paths | resetdb | quit")
 	reader := bufio.NewReader(os.Stdin)
 
 	for {
 		fmt.Print("> ")
-		line, _ := reader.ReadString('\n')
+		line, readErr := reader.ReadString('\n')
+		if readErr != nil && len(line) == 0 {
+			cancel()
+			s.Stop()
+			return
+		}
 		cmd := strings.TrimSpace(strings.ToLower(line))
 
 		switch cmd {
@@ -94,20 +106,37 @@ func main() {
 				fmt.Println("Błąd reloadu:", err)
 				continue
 			}
+			if err := s.UpdateConfig(newCfg); err != nil {
+				log.Error().Err(err).Msg("Błąd zastosowania konfiguracji")
+				fmt.Println("Błąd reloadu:", err)
+				continue
+			}
 			cfg = newCfg
-			s.UpdateConfig(cfg)
 			log.Info().Msg("Konfiguracja przeładowana")
 			fmt.Println("Konfiguracja przeładowana")
 		case "status":
-			if r, ok := any(s).(interface{ IsRunning() bool }); ok {
-				if r.IsRunning() {
-					fmt.Println("Status: DZIAŁA")
-				} else {
-					fmt.Println("Status: ZATRZYMANY")
-				}
+			if s.IsRunning() {
+				fmt.Println("Status: DZIAŁA")
 			} else {
-				fmt.Println("Status: (syncer nie wystawia IsRunning)")
+				fmt.Println("Status: ZATRZYMANY")
 			}
+			for _, status := range s.IntegrationStatuses() {
+				fmt.Printf("  %s: %s", status.Name, status.State)
+				if status.LastError != "" {
+					fmt.Printf(" (%s)", status.LastError)
+				}
+				fmt.Println()
+			}
+			printQueueDiagnostics(dbh.DB)
+		case "retry-errors":
+			res := dbh.DB.Model(&db.WooTask{}).Where("status = ?", "error").Updates(map[string]any{
+				"status": "pending", "attempts": 0, "last_error": "", "next_attempt_at": nil, "started_at": nil, "finished_at": nil,
+			})
+			if res.Error != nil {
+				fmt.Println("Błąd:", res.Error)
+				continue
+			}
+			fmt.Printf("Ponowiono %d tasków.\n", res.RowsAffected)
 		case "paths":
 			fmt.Println("Logi:", filepath.Join(appDir, "app.log"))
 			fmt.Println("Config:", cfgPath)
@@ -125,6 +154,7 @@ func main() {
 				continue
 			}
 
+			s.Stop()
 			log.Warn().Msg("Czyszczenie bazy...")
 			if err := resetDB(dbh.DB); err != nil {
 				log.Error().Err(err).Msg("Błąd czyszczenia bazy")
@@ -136,7 +166,7 @@ func main() {
 		case "":
 			// enter – ignoruj
 		default:
-			fmt.Println("Nieznana komenda. Użyj: start | stop | reload | status | paths | resetdb! | quit")
+			fmt.Println("Nieznana komenda. Użyj: start | stop | reload | status | retry-errors | paths | resetdb | quit")
 		}
 	}
 }
@@ -163,12 +193,33 @@ func resetDB(gdb *gorm.DB) error {
 		"kvs",
 	}
 
-	for _, t := range tables {
-		if err := gdb.Exec(fmt.Sprintf("DELETE FROM %s;", t)).Error; err != nil {
-			return fmt.Errorf("błąd czyszczenia tabeli %s: %w", t, err)
+	return gdb.Transaction(func(tx *gorm.DB) error {
+		for _, table := range tables {
+			if err := tx.Exec(fmt.Sprintf("DELETE FROM %s;", table)).Error; err != nil {
+				return fmt.Errorf("błąd czyszczenia tabeli %s: %w", table, err)
+			}
 		}
+		return nil
+	})
+}
+
+func printQueueDiagnostics(gdb *gorm.DB) {
+	type row struct {
+		Status string
+		Count  int64
 	}
-	// reset autoinkrementacji w SQLite (ignoruj błąd dla innych silników DB)
-	_ = gdb.Exec("DELETE FROM sqlite_sequence;").Error
-	return nil
+	var rows []row
+	if err := gdb.Model(&db.WooTask{}).Select("status, COUNT(*) AS count").Group("status").Find(&rows).Error; err != nil {
+		fmt.Println("  kolejka: błąd odczytu:", err)
+		return
+	}
+	if len(rows) == 0 {
+		fmt.Println("  kolejka: pusta")
+		return
+	}
+	fmt.Print("  kolejka:")
+	for _, row := range rows {
+		fmt.Printf(" %s=%d", row.Status, row.Count)
+	}
+	fmt.Println()
 }

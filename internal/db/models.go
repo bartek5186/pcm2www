@@ -8,9 +8,9 @@ import (
 // import_files
 type ImportFile struct {
 	ImportID     uint   `gorm:"primaryKey;column:import_id"`
-	Filename     string `gorm:"uniqueIndex"`
+	Filename     string `gorm:"index:idx_import_files_filename_lookup"`
 	FileTimeUTC  string
-	TransmisjaID string `gorm:"uniqueIndex"`
+	TransmisjaID string `gorm:"index:idx_import_files_transmission_lookup"`
 	SHA256       string `gorm:"uniqueIndex"`
 	SizeBytes    int64
 	Status       int       `gorm:"index"` // 0=pending, 1=done, 2=error
@@ -22,8 +22,8 @@ type ImportFile struct {
 // st_products (staging)
 type StProduct struct {
 	ID               uint   `gorm:"primaryKey;autoIncrement"`
-	TowarID          int64  `gorm:"uniqueIndex:uniq_towar_kod"`
-	Kod              string `gorm:"uniqueIndex:uniq_towar_kod"`
+	TowarID          int64  `gorm:"uniqueIndex:uniq_st_products_towar_id"`
+	Kod              string `gorm:"index"`
 	Nazwa            string
 	Opis1            string
 	VatID            int64
@@ -59,42 +59,43 @@ type StStock struct {
 
 // woo_products_cache
 type WooProductCache struct {
-	WooID        uint   `gorm:"primaryKey"`
-	TowarID      *int64 `gorm:"index"`
-	Kod          string `gorm:"index"` // SKU
-	Ean          string `gorm:"index"`
-	Name         string
-	PriceRegular float64
-	PriceSale    float64
-	HurtPrice    float64
-	TaxClass     string  // "" = standard, "2300", "800", "500", "zero-rate"
-	StockQty     float64
+	WooID             uint   `gorm:"primaryKey"`
+	TowarID           *int64 `gorm:"index"`
+	Kod               string `gorm:"index"` // SKU
+	Ean               string `gorm:"index"`
+	Name              string
+	PriceRegular      float64
+	PriceSale         float64
+	HurtPrice         float64
+	TaxClass          string // "" = standard, "2300", "800", "500", "zero-rate"
+	StockQty          float64
 	StockManaged      bool
 	StockStatus       string // instock / outofstock / onbackorder
 	Backorders        string // no / notify / yes
 	CatalogVisibility string // visible / hidden / catalog / search
 	Status            string // publish/draft/trash
-	Type         string
-	DateModified string
+	Type              string
+	DateModified      string
 }
 
 // woo_tasks
 type WooTask struct {
-	TaskID      uint   `gorm:"primaryKey;column:task_id"`
-	TaskKey     string `gorm:"uniqueIndex"`
-	ImportID    uint   `gorm:"index"`
-	TowarID     *int64 `gorm:"index"`
-	WooID       *uint  `gorm:"index"`
-	Kind        string `gorm:"index"` // np. product.update, stock.update
-	PayloadJSON string `gorm:"type:text"`
-	DependsOn   *uint
-	Status      string `gorm:"index;default:pending"` // pending/done/error
-	Attempts    int
-	StartedAt   *time.Time
-	FinishedAt  *time.Time
-	LastError   string    `gorm:"type:text"`
-	CreatedAt   time.Time `gorm:"autoCreateTime"`
-	UpdatedAt   time.Time `gorm:"autoUpdateTime"`
+	TaskID        uint   `gorm:"primaryKey;column:task_id"`
+	TaskKey       string `gorm:"uniqueIndex"`
+	ImportID      uint   `gorm:"index"`
+	TowarID       *int64 `gorm:"index"`
+	WooID         *uint  `gorm:"index"`
+	Kind          string `gorm:"index"` // np. product.update, stock.update
+	PayloadJSON   string `gorm:"type:text"`
+	DependsOn     *uint
+	Status        string `gorm:"index;default:pending"` // pending/running/done/skipped/error/superseded
+	Attempts      int
+	NextAttemptAt *time.Time `gorm:"index"`
+	StartedAt     *time.Time
+	FinishedAt    *time.Time
+	LastError     string    `gorm:"type:text"`
+	CreatedAt     time.Time `gorm:"autoCreateTime"`
+	UpdatedAt     time.Time `gorm:"autoUpdateTime"`
 }
 
 type LinkIssue struct {
@@ -113,4 +114,10 @@ type LinkIssue struct {
 type KV struct {
 	K string `gorm:"primaryKey"`
 	V string
+}
+
+type SchemaMigration struct {
+	Version   uint      `gorm:"primaryKey"`
+	Name      string    `gorm:"not null"`
+	AppliedAt time.Time `gorm:"not null"`
 }

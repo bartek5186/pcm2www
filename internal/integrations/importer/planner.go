@@ -58,8 +58,7 @@ type plannerStats struct {
 	LinkedProducts            int
 	UnlinkedProducts          int
 	AmbiguousProducts         int
-	EANTasksCreated           int
-	EANTasksRequeued          int
+	DeletionMarkedProducts    int
 	StockTasksCreated         int
 	StockTasksRequeued        int
 	PriceTasksCreated         int
@@ -67,8 +66,6 @@ type plannerStats struct {
 	AvailabilityTasksCreated  int
 	AvailabilityTasksRequeued int
 	ExistingPendingOrDone     int
-	PolicySkipEANPresent      int
-	PolicySkipDuplicateEAN    int
 	PolicySkipStockUnmanaged  int
 	PolicySkipPriceSale       int
 }
@@ -117,23 +114,14 @@ func (i *Importer) PlanWooTasksForRecentImports(window time.Duration) error {
 }
 
 func (i *Importer) PlanWooTasks(importID uint) error {
-	tx := i.db.Begin()
-	committed := false
-	defer func() {
-		if !committed {
-			_ = tx.Rollback().Error
-		}
-	}()
-
-	stats, err := i.planWooTasksTx(tx, importID)
-	if err != nil {
+	var stats plannerStats
+	if err := i.db.Transaction(func(tx *gorm.DB) error {
+		var err error
+		stats, err = i.planWooTasksTx(tx, importID)
+		return err
+	}); err != nil {
 		return err
 	}
-
-	if err := tx.Commit().Error; err != nil {
-		return err
-	}
-	committed = true
 
 	i.log.Info().
 		Uint("import_id", stats.ImportID).
@@ -142,15 +130,12 @@ func (i *Importer) PlanWooTasks(importID uint) error {
 		Int("linked_products", stats.LinkedProducts).
 		Int("unlinked_products", stats.UnlinkedProducts).
 		Int("ambiguous_products", stats.AmbiguousProducts).
-		Int("ean_tasks_created", stats.EANTasksCreated).
-		Int("ean_tasks_requeued", stats.EANTasksRequeued).
+		Int("deletion_marked_products", stats.DeletionMarkedProducts).
 		Int("stock_tasks_created", stats.StockTasksCreated).
 		Int("stock_tasks_requeued", stats.StockTasksRequeued).
 		Int("price_tasks_created", stats.PriceTasksCreated).
 		Int("price_tasks_requeued", stats.PriceTasksRequeued).
 		Int("existing_tasks", stats.ExistingPendingOrDone).
-		Int("skip_ean_present", stats.PolicySkipEANPresent).
-		Int("skip_duplicate_ean", stats.PolicySkipDuplicateEAN).
 		Int("skip_stock_unmanaged", stats.PolicySkipStockUnmanaged).
 		Int("skip_price_sale", stats.PolicySkipPriceSale).
 		Int("availability_tasks_created", stats.AvailabilityTasksCreated).
@@ -196,11 +181,6 @@ func (i *Importer) planWooTasksTx(tx *gorm.DB, importID uint) (plannerStats, err
 		cacheByTowarID[*row.TowarID] = append(cacheByTowarID[*row.TowarID], row)
 	}
 
-	eanOwners, err := loadCacheEANOwners(tx)
-	if err != nil {
-		return stats, err
-	}
-
 	for _, row := range sourceRows {
 		candidates := cacheByTowarID[row.TowarID]
 		switch len(candidates) {
@@ -225,32 +205,15 @@ func (i *Importer) planWooTasksTx(tx *gorm.DB, importID uint) (plannerStats, err
 		}
 
 		cache := candidates[0]
-
-		if created, requeued, existed, err := i.planEANUpdateTask(tx, importID, row, cache, eanOwners); err != nil {
-			return stats, err
-		} else {
-			switch {
-			case created:
-				stats.EANTasksCreated++
-			case requeued:
-				stats.EANTasksRequeued++
-			case existed:
-				stats.ExistingPendingOrDone++
-			default:
-				if cleanEAN(row.Kod) != "" && cleanEAN(cache.Ean) != "" && cleanEAN(row.Kod) != cleanEAN(cache.Ean) {
-					stats.PolicySkipEANPresent++
-				}
-				if ownerIDs := eanOwners[cleanEAN(row.Kod)]; cleanEAN(row.Kod) != "" && len(ownerIDs) > 0 {
-					dupOwners := 0
-					for _, ownerID := range ownerIDs {
-						if ownerID != cache.WooID {
-							dupOwners++
-						}
-					}
-					if dupOwners > 0 && cleanEAN(cache.Ean) == "" {
-						stats.PolicySkipDuplicateEAN++
-					}
-				}
+		if !sourceProductEligible(row) {
+			stats.DeletionMarkedProducts++
+		}
+		if !sourceProductEligible(row) || floatAlmostEqual(row.CenaDetal, 0) {
+			if err := supersedePendingWooTasks(tx, cache.WooID, []string{
+				db.WooTaskKindStockUpdate,
+				db.WooTaskKindPriceUpdate,
+			}, "source product is unavailable"); err != nil {
+				return stats, err
 			}
 		}
 
@@ -349,82 +312,8 @@ func loadPlannerCacheRows(tx *gorm.DB, towarIDs []int64) ([]plannerCacheRow, err
 	return rows, nil
 }
 
-func loadCacheEANOwners(tx *gorm.DB) (map[string][]uint, error) {
-	var rows []struct {
-		WooID uint
-		Ean   string
-	}
-	if err := tx.Model(&db.WooProductCache{}).
-		Select("woo_id", "ean").
-		Find(&rows).Error; err != nil {
-		return nil, err
-	}
-
-	owners := make(map[string][]uint, len(rows))
-	for _, row := range rows {
-		ean := cleanEAN(row.Ean)
-		if ean == "" {
-			continue
-		}
-		owners[ean] = append(owners[ean], row.WooID)
-	}
-	return owners, nil
-}
-
-func (i *Importer) planEANUpdateTask(tx *gorm.DB, importID uint, src plannerSourceRow, cache plannerCacheRow, eanOwners map[string][]uint) (created, requeued, existed bool, err error) {
-	desiredEAN := cleanEAN(src.Kod)
-	currentEAN := cleanEAN(cache.Ean)
-	if desiredEAN == "" || desiredEAN == currentEAN {
-		return false, false, false, nil
-	}
-	if currentEAN != "" {
-		i.log.Debug().
-			Uint("import_id", importID).
-			Uint("woo_id", cache.WooID).
-			Int64("towar_id", src.TowarID).
-			Str("current_ean", currentEAN).
-			Str("desired_ean", desiredEAN).
-			Msg("task planner: skip EAN overwrite by policy")
-		return false, false, false, nil
-	}
-	for _, ownerID := range eanOwners[desiredEAN] {
-		if ownerID == cache.WooID {
-			continue
-		}
-		i.log.Warn().
-			Uint("import_id", importID).
-			Uint("woo_id", cache.WooID).
-			Int64("towar_id", src.TowarID).
-			Str("desired_ean", desiredEAN).
-			Uint("owner_woo_id", ownerID).
-			Msg("task planner: skip duplicate EAN by policy")
-		return false, false, false, nil
-	}
-
-	payload := db.WooEANUpdatePayload{
-		ImportID:    importID,
-		WooID:       cache.WooID,
-		TowarID:     src.TowarID,
-		SKU:         cache.Kod,
-		ProductName: cache.Name,
-		SourceKod:   src.Kod,
-		CurrentEAN:  currentEAN,
-		DesiredEAN:  desiredEAN,
-	}
-	task := db.WooTask{
-		TaskKey:     buildTaskKey(db.WooTaskKindEANUpdate, cache.WooID, desiredEAN),
-		ImportID:    importID,
-		TowarID:     ptrInt64(src.TowarID),
-		WooID:       ptrUint(cache.WooID),
-		Kind:        db.WooTaskKindEANUpdate,
-		PayloadJSON: mustJSON(payload),
-		Status:      "pending",
-	}
-	return enqueueWooTask(tx, task)
-}
-
 func (i *Importer) planStockUpdateTask(tx *gorm.DB, importID uint, src plannerSourceRow, cache plannerCacheRow) (created, requeued, existed, skipped bool, err error) {
-	if floatAlmostEqual(src.CenaDetal, 0) {
+	if !sourceProductEligible(src) || floatAlmostEqual(src.CenaDetal, 0) {
 		return false, false, false, false, nil // produkt niedostępny (brak ceny) — stock obsługuje availability.update
 	}
 	desiredStock := math.Max(src.TotalStock-src.TotalReserved, 0)
@@ -539,7 +428,7 @@ func (i *Importer) wooPriceFromGross(gross float64, vatID int64) float64 {
 }
 
 func (i *Importer) planPriceUpdateTask(tx *gorm.DB, importID uint, src plannerSourceRow, cache plannerCacheRow) (created, requeued, existed, skipped bool, err error) {
-	if floatAlmostEqual(src.CenaDetal, 0) {
+	if !sourceProductEligible(src) || floatAlmostEqual(src.CenaDetal, 0) {
 		return false, false, false, false, nil // produkt niedostępny (brak ceny) — nie ustawiaj ceny 0
 	}
 	desiredRegular := i.wooPriceFromGross(src.CenaDetal, src.VatID)
@@ -587,7 +476,9 @@ func (i *Importer) planPriceUpdateTask(tx *gorm.DB, importID uint, src plannerSo
 }
 
 func (i *Importer) planAvailabilityUpdateTask(tx *gorm.DB, importID uint, src plannerSourceRow, cache plannerCacheRow) (created, requeued, existed bool, err error) {
-	unavailable := floatAlmostEqual(src.CenaDetal, 0)
+	unavailable := !sourceProductEligible(src) || floatAlmostEqual(src.CenaDetal, 0)
+	setStock := !unavailable && !cache.StockManaged
+	desiredStock := math.Max(src.TotalStock-src.TotalReserved, 0)
 
 	if unavailable {
 		if !cache.StockManaged && cache.StockStatus == "outofstock" && cache.CatalogVisibility == "hidden" {
@@ -605,15 +496,21 @@ func (i *Importer) planAvailabilityUpdateTask(tx *gorm.DB, importID uint, src pl
 	}
 
 	payload := db.WooAvailabilityPayload{
-		ImportID:    importID,
-		WooID:       cache.WooID,
-		TowarID:     src.TowarID,
-		SKU:         cache.Kod,
-		ProductName: cache.Name,
-		Unavailable: unavailable,
+		ImportID:     importID,
+		WooID:        cache.WooID,
+		TowarID:      src.TowarID,
+		SKU:          cache.Kod,
+		ProductName:  cache.Name,
+		Unavailable:  unavailable,
+		SetStock:     setStock,
+		DesiredStock: desiredStock,
+	}
+	keyParts := []string{stateKey}
+	if setStock {
+		keyParts = append(keyParts, normalizeFloatKey(desiredStock))
 	}
 	task := db.WooTask{
-		TaskKey:     buildTaskKey(db.WooTaskKindAvailabilityUpdate, cache.WooID, stateKey),
+		TaskKey:     buildTaskKey(db.WooTaskKindAvailabilityUpdate, cache.WooID, keyParts...),
 		ImportID:    importID,
 		TowarID:     ptrInt64(src.TowarID),
 		WooID:       ptrUint(cache.WooID),
@@ -624,7 +521,40 @@ func (i *Importer) planAvailabilityUpdateTask(tx *gorm.DB, importID uint, src pl
 	return enqueueWooTask(tx, task)
 }
 
+func sourceProductEligible(src plannerSourceRow) bool {
+	return !src.DoUsuniecia
+}
+
+func supersedePendingWooTasks(tx *gorm.DB, wooID uint, kinds []string, reason string) error {
+	if len(kinds) == 0 {
+		return nil
+	}
+	now := time.Now()
+	return tx.Model(&db.WooTask{}).
+		Where("woo_id = ? AND kind IN ? AND status = ?", wooID, kinds, "pending").
+		Updates(map[string]any{
+			"status":          "superseded",
+			"last_error":      reason,
+			"next_attempt_at": nil,
+			"finished_at":     now,
+		}).Error
+}
+
 func enqueueWooTask(tx *gorm.DB, task db.WooTask) (created, requeued, existed bool, err error) {
+	if task.WooID != nil {
+		now := time.Now()
+		if err := tx.Model(&db.WooTask{}).
+			Where("woo_id = ? AND kind = ? AND task_key <> ? AND status = ?", *task.WooID, task.Kind, task.TaskKey, "pending").
+			Updates(map[string]any{
+				"status":          "superseded",
+				"last_error":      "superseded by newer desired state",
+				"next_attempt_at": nil,
+				"finished_at":     now,
+			}).Error; err != nil {
+			return false, false, false, err
+		}
+	}
+
 	var existing db.WooTask
 	switch err = tx.Where("task_key = ?", task.TaskKey).Take(&existing).Error; {
 	case err == nil:
@@ -633,17 +563,18 @@ func enqueueWooTask(tx *gorm.DB, task db.WooTask) (created, requeued, existed bo
 			return false, false, true, nil
 		default:
 			updates := map[string]any{
-				"import_id":    task.ImportID,
-				"towar_id":     task.TowarID,
-				"woo_id":       task.WooID,
-				"kind":         task.Kind,
-				"payload_json": task.PayloadJSON,
-				"status":       "pending",
-				"attempts":     0,
-				"last_error":   "",
-				"started_at":   nil,
-				"finished_at":  nil,
-				"depends_on":   task.DependsOn,
+				"import_id":       task.ImportID,
+				"towar_id":        task.TowarID,
+				"woo_id":          task.WooID,
+				"kind":            task.Kind,
+				"payload_json":    task.PayloadJSON,
+				"status":          "pending",
+				"attempts":        0,
+				"last_error":      "",
+				"next_attempt_at": nil,
+				"started_at":      nil,
+				"finished_at":     nil,
+				"depends_on":      task.DependsOn,
 			}
 			if err := tx.Model(&db.WooTask{}).Where("task_id = ?", existing.TaskID).Updates(updates).Error; err != nil {
 				return false, false, false, err
