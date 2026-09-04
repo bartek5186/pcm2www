@@ -29,9 +29,55 @@ jobs:
 
   windows-build:
     runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.value }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
-      - run: GOOS=windows GOARCH=amd64 go build -o pcm2www.exe .
+      - name: Ustal wersję
+        id: version
+        shell: bash
+        run: |
+          if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
+            version="${GITHUB_REF_NAME#v}"
+          else
+            version="dev-${GITHUB_SHA::7}"
+          fi
+          echo "value=$version" >> "$GITHUB_OUTPUT"
+      - name: Zbuduj aplikację Windows
+        run: ./build.sh "${{ steps.version.outputs.value }}"
+      - name: Opublikuj artefakt
+        uses: actions/upload-artifact@v4
+        with:
+          name: ProcyonSyncer-windows-amd64-${{ steps.version.outputs.value }}
+          path: bin/ProcyonSyncer.exe
+          if-no-files-found: error
+          retention-days: 30
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [test, race, windows-build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Pobierz zbudowaną aplikację
+        uses: actions/download-artifact@v4
+        with:
+          name: ProcyonSyncer-windows-amd64-${{ needs.windows-build.outputs.version }}
+          path: release
+      - name: Utwórz lub uaktualnij GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" release/ProcyonSyncer.exe --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" release/ProcyonSyncer.exe \
+              --verify-tag \
+              --generate-notes \
+              --title "Procyon Syncer $GITHUB_REF_NAME"
+          fi

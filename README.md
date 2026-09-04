@@ -241,6 +241,19 @@ Proces utrzymuje blokadę `pcm2www.lock`, dlatego druga lokalna instancja nie mo
 
 Polecenie `./scripts/validate_xml_sequence.sh` kopiuje po kolei wszystkie `imports/incoming_test/exp_wyk_*.xml` do katalogu tymczasowego i importuje je do izolowanej bazy SQLite w pamięci. Nie otwiera ani nie zmienia bazy aplikacji. Po **każdym pojedynczym XML-u** niezależny model referencyjny porównuje pełny stan wszystkich pól `st_products`, `st_stocks` (w tym `stan_prev`) i tożsamość importu. Błąd wskazuje numer kroku, nazwę XML-a oraz produkt lub magazyn, na którym stan się rozszedł.
 
+## Binarka z GitHub Actions
+
+Każdy push i pull request buduje `ProcyonSyncer.exe`. Plik jest dostępny przez 30 dni w szczegółach uruchomienia workflow, w sekcji **Artifacts**.
+
+Tag w formacie `vX.Y.Z` tworzy trwały GitHub Release i dołącza do niego gotową binarkę Windows. Przykład:
+
+```bash
+git tag v1.0.0
+git push origin v1.0.0
+```
+
+Wersja z taga jest również zapisywana wewnątrz aplikacji. Ponowne uruchomienie workflow dla istniejącego taga podmienia binarkę w tym samym wydaniu.
+
 ---
 
 ## Przepływ danych
