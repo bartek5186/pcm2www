@@ -111,6 +111,39 @@ func TestUpdateConfigRejectsInvalidConfigWithoutStoppingCurrentRun(t *testing.T)
 	s.Stop()
 }
 
+func TestValidateConfigHasNoLifecycleSideEffects(t *testing.T) {
+	const integrationName = "syncer_validate_config_test"
+	integrations.Register(integrationName, func(zerolog.Logger, json.RawMessage) (integrations.Integration, error) {
+		return &lifecycleTestIntegration{started: make(chan context.Context, 1)}, nil
+	})
+	original := &conf.Config{
+		Database:     conf.DBConfig{Driver: "sqlite"},
+		Integrations: map[string]json.RawMessage{integrationName: json.RawMessage(`{}`)},
+	}
+	s := New(zerolog.Nop(), original, nil)
+
+	candidate := &conf.Config{
+		Database:     conf.DBConfig{Driver: "sqlite"},
+		Integrations: map[string]json.RawMessage{integrationName: json.RawMessage(`{}`)},
+	}
+	if err := s.ValidateConfig(candidate); err != nil {
+		t.Fatal(err)
+	}
+	if s.cfg != original || s.IsRunning() {
+		t.Fatal("validation changed syncer configuration or lifecycle state")
+	}
+
+	bad := &conf.Config{Database: conf.DBConfig{Driver: "sqlite"}, Integrations: map[string]json.RawMessage{
+		"does_not_exist": json.RawMessage(`{}`),
+	}}
+	if err := s.ValidateConfig(bad); err == nil {
+		t.Fatal("validation accepted an unknown integration")
+	}
+	if s.cfg != original || s.IsRunning() {
+		t.Fatal("rejected validation changed syncer configuration or lifecycle state")
+	}
+}
+
 func TestIntegrationFailureIsVisibleInStatus(t *testing.T) {
 	const integrationName = "syncer_failure_status_test"
 	integrations.Register(integrationName, func(zerolog.Logger, json.RawMessage) (integrations.Integration, error) {

@@ -13,13 +13,15 @@ Integrator działa cyklicznie, pobiera dane z katalogu eksportów PC-Market (`ex
 - **Obsługa cache** – pełne i przyrostowe odświeżanie danych z WooCommerce
 - **Import plików PCM** – aktualnie obsługiwany format: `exp_wyk_*.xml` **[inne typy: NIEGOTOWE]**
 - **Integracja przez REST API** WooCommerce: aktualizacja stanu, ceny i dostępności (aktywne); zmiana EAN i tworzenie nowych produktów są wyłączone
-- **Elastyczna konfiguracja** poprzez plik JSON
+- **Elastyczna konfiguracja** poprzez natywne okno ustawień na Windows lub plik JSON
 - **Ciągła praca w tle** – monitoring katalogu, kolejka tasków, worker wysyłki do Woo
 
 ---
 
 Integrator posiada narzędzie CLI (Linux/Mac) oraz aplikację z systray (Windows).
 Plik konfiguracyjny: `~/.config/pcm2www/config.json`
+
+W wersji Windows pozycja **Ustawienia…** w menu ikony otwiera natywny formularz do konfiguracji WooCommerce, importu XML, cache i automatycznego startu integracji. Sekret Woo jest domyślnie zamaskowany, katalog eksportów można wybrać w systemowym oknie, a **Zapisz i zastosuj** waliduje dane przed przeładowaniem działającej synchronizacji. W sekcji **Uruchamianie** można niezależnie włączyć start programu po zalogowaniu do Windows oraz automatyczny start synchronizacji po otwarciu programu. Pola zaawansowane, których formularz nie pokazuje (m.in. baza danych, lista pól API i mapowania własnych pól), pozostają bez zmian; przycisk otwierający pełny `config.json` znajduje się wewnątrz okna ustawień.
 
 ---
 
@@ -109,12 +111,14 @@ Przykłady:
 
 ## Parametry globalne
 
-- **auto_start** – określa, czy po uruchomieniu procesu aplikacja ma od razu wystartować wszystkie integracje zapisane w `integrations`. `true` uruchamia importer, cache i workery bez klikania/komendy `start`; `false` uruchamia tylko CLI lub ikonę w trayu i czeka na ręczny start. To ustawienie nie uruchamia programu razem z Windowsem/Linuxem i nie jest harmonogramem importu.
+- **auto_start** – określa, czy po uruchomieniu procesu aplikacja ma od razu wystartować wszystkie integracje zapisane w `integrations`. `true` uruchamia importer, cache i workery bez klikania/komendy `start`; `false` uruchamia tylko CLI lub ikonę w trayu i czeka na ręczny start. Osobna opcja **Uruchamiaj Procyon Syncer po zalogowaniu do Windows** rejestruje aplikację w autostarcie bieżącego użytkownika Windows; nie jest zapisywana w tym pliku JSON.
 - **sync_interval_seconds** – interwał wewnętrznego heartbeat syncera. Nie zastępuje `poll_sec` importera ani workera.
 
 ### Pierwsze uruchomienie
 
 `LoadOrCreate()` tworzy kompletny szablon z integracjami `woocommerce` i `importer`, ale ustawia `auto_start=false`. Przed pierwszym ręcznym startem trzeba wpisać prawdziwy URL i klucze Woo oraz utworzyć lub wskazać istniejący `watch_dir`. Parser odrzuca nieznane pola JSON, a fabryki integracji odrzucają placeholdery, błędny URL, niedozwolony tryb ceny i niepoprawne interwały. Dopiero po udanym ręcznym starcie warto świadomie zmienić `auto_start` na `true`.
+
+Przy uruchomieniu istniejący config ze starszej wersji jest automatycznie uzupełniany o brakującą sekcję `integrations.importer`, o ile zawiera integrację `woocommerce`. Dawne pole główne `watch_dir` zostaje użyte jako katalog importu; jeśli go nie ma, przyjmowane jest `~/pcm2www/imports`. Migracja zapisuje uzupełniony plik tylko raz i nie nadpisuje istniejących ustawień importera ani WooCommerce.
 
 ---
 

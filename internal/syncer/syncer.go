@@ -274,6 +274,21 @@ func (s *Syncer) UpdateConfig(cfg *conf.Config) error {
 	return nil
 }
 
+// ValidateConfig performs the same integration construction checks as Start,
+// without changing the current configuration or lifecycle state.
+func (s *Syncer) ValidateConfig(cfg *conf.Config) error {
+	s.lifecycleMu.Lock()
+	defer s.lifecycleMu.Unlock()
+	if cfg == nil {
+		return fmt.Errorf("syncer: nil config")
+	}
+	if err := cfg.Validate(); err != nil {
+		return err
+	}
+	_, err := s.buildIntegrations(cfg)
+	return err
+}
+
 func (s *Syncer) IsRunning() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()

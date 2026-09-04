@@ -2,6 +2,7 @@
 package conf
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -49,11 +50,26 @@ type ImporterDefaults struct {
 	StabilitySeconds int    `json:"stability_seconds"`
 }
 
+const defaultImporterWatchDir = "~/pcm2www/imports"
+
+func defaultImporterConfig(legacyWatchDir string) ImporterDefaults {
+	watchDir := strings.TrimSpace(legacyWatchDir)
+	if watchDir == "" {
+		watchDir = defaultImporterWatchDir
+	}
+	return ImporterDefaults{
+		WatchDir:         watchDir,
+		PollSec:          5,
+		PriceMode:        "gross",
+		StabilitySeconds: 2,
+	}
+}
+
 func LoadOrCreate(path string) (*Config, bool, error) {
 	// upewnij się, że katalog istnieje
 	_ = os.MkdirAll(filepath.Dir(path), 0o755)
 
-	f, err := os.Open(path)
+	rawConfig, err := os.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
 			// Pierwszy plik jest kompletnym, ale nieaktywnym szablonem. AutoStart
@@ -81,12 +97,7 @@ func LoadOrCreate(path string) (*Config, bool, error) {
 				},
 			}
 			rawWoo, _ := json.Marshal(woo)
-			rawImporter, _ := json.Marshal(ImporterDefaults{
-				WatchDir:         "~/pcm2www/imports",
-				PollSec:          5,
-				PriceMode:        "gross",
-				StabilitySeconds: 2,
-			})
+			rawImporter, _ := json.Marshal(defaultImporterConfig(""))
 
 			cfg := &Config{
 				Database: DBConfig{
@@ -104,12 +115,11 @@ func LoadOrCreate(path string) (*Config, bool, error) {
 			}
 			return cfg, true, nil
 		}
-		return nil, false, fmt.Errorf("błąd otwierania configa: %w", err)
+		return nil, false, fmt.Errorf("błąd odczytu configa: %w", err)
 	}
-	defer f.Close()
 
 	var cfg Config
-	dec := json.NewDecoder(f)
+	dec := json.NewDecoder(bytes.NewReader(rawConfig))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&cfg); err != nil {
 		return nil, false, fmt.Errorf("błąd parsowania configa: %w", err)
@@ -126,10 +136,44 @@ func LoadOrCreate(path string) (*Config, bool, error) {
 	if strings.TrimSpace(cfg.Database.Driver) == "" {
 		cfg.Database.Driver = "sqlite"
 	}
+	migrated, err := migrateLegacyConfig(&cfg)
+	if err != nil {
+		return nil, false, err
+	}
 	if err := cfg.Validate(); err != nil {
 		return nil, false, err
 	}
+	if migrated {
+		if err := Save(path, &cfg); err != nil {
+			return nil, false, fmt.Errorf("błąd aktualizacji starej konfiguracji: %w", err)
+		}
+	}
 	return &cfg, false, nil
+}
+
+// migrateLegacyConfig uzupełnia wyłącznie sekcje, których brak wynika ze
+// starszego, obsługiwanego formatu konfiguracji. Istniejące ustawienia nigdy
+// nie są nadpisywane.
+func migrateLegacyConfig(cfg *Config) (bool, error) {
+	if cfg == nil {
+		return false, nil
+	}
+	if cfg.Integrations == nil {
+		cfg.Integrations = map[string]json.RawMessage{}
+	}
+	if _, hasWoo := cfg.Integrations["woocommerce"]; !hasWoo {
+		return false, nil
+	}
+	if _, hasImporter := cfg.Integrations["importer"]; hasImporter {
+		return false, nil
+	}
+
+	rawImporter, err := json.Marshal(defaultImporterConfig(cfg.WatchDir))
+	if err != nil {
+		return false, fmt.Errorf("błąd migracji konfiguracji importera: %w", err)
+	}
+	cfg.Integrations["importer"] = rawImporter
+	return true, nil
 }
 
 func (c *Config) Validate() error {

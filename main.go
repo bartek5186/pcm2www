@@ -114,7 +114,7 @@ func main() {
 
 		systray.AddSeparator()
 		mOpenLogs := systray.AddMenuItem("Otwórz logi", "Pokaż plik log")
-		mOpenCfg := systray.AddMenuItem("Ustawienia (config.json)", "Otwórz plik konfiguracyjny")
+		mSettings := systray.AddMenuItem("Ustawienia…", "Otwórz okno ustawień")
 		mReload := systray.AddMenuItem("Przeładuj konfigurację", "Wczytaj ponownie config.json")
 		systray.AddSeparator()
 		mAbout := systray.AddMenuItem(fmt.Sprintf("Procyon Syncer %s", ver), "O programie")
@@ -151,10 +151,35 @@ func main() {
 					systray.SetTooltip(fmt.Sprintf("Procyon Syncer %s — zatrzymane", ver))
 
 				case <-mOpenLogs.ClickedCh:
-					openInExplorer(filepath.Join(appDir, "app.log"))
+					if err := openInExplorer(filepath.Join(appDir, "app.log")); err != nil {
+						log.Error().Err(err).Msg("Nie można otworzyć logów")
+					}
 
-				case <-mOpenCfg.ClickedCh:
-					openInExplorer(cfgPath)
+				case <-mSettings.ClickedCh:
+					updatedCfg, err := showSettingsWindow(cfg, cfgPath, func(candidate *conf.Config) error {
+						if err := s.ValidateConfig(candidate); err != nil {
+							return err
+						}
+						if err := conf.Save(cfgPath, candidate); err != nil {
+							return fmt.Errorf("zapis config.json: %w", err)
+						}
+						if err := s.UpdateConfig(candidate); err != nil {
+							if rollbackErr := conf.Save(cfgPath, cfg); rollbackErr != nil {
+								return fmt.Errorf("zastosowanie konfiguracji: %v; przywrócenie pliku: %w", err, rollbackErr)
+							}
+							return fmt.Errorf("zastosowanie konfiguracji: %w", err)
+						}
+						return nil
+					})
+					if err != nil {
+						log.Error().Err(err).Msg("Błąd okna ustawień")
+						messageBox("Procyon Syncer — ustawienia", err.Error())
+						continue
+					}
+					if updatedCfg != nil {
+						cfg = updatedCfg
+						log.Info().Msg("Ustawienia zapisane i zastosowane")
+					}
 
 				case <-mReload.ClickedCh:
 					newCfg, _, err := conf.LoadOrCreate(cfgPath)
@@ -204,13 +229,13 @@ func messageBoxWithIcon(title, text string) {
 	messageBox(title, text)
 }
 
-func openInExplorer(path string) {
+func openInExplorer(path string) error {
 	switch runtime.GOOS {
 	case "windows":
-		_ = exec.Command("cmd", "/C", "start", "", path).Start()
+		return exec.Command("cmd", "/C", "start", "", path).Start()
 	case "darwin":
-		_ = exec.Command("open", path).Start()
+		return exec.Command("open", path).Start()
 	default:
-		_ = exec.Command("xdg-open", path).Start()
+		return exec.Command("xdg-open", path).Start()
 	}
 }
