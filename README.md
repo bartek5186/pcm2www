@@ -23,6 +23,8 @@ Plik konfiguracyjny: `~/.config/pcm2www/config.json`
 
 W wersji Windows pozycja **Ustawienia…** w menu ikony otwiera natywny formularz do konfiguracji WooCommerce, importu XML, cache i automatycznego startu integracji. Sekret Woo jest domyślnie zamaskowany, katalog eksportów można wybrać w systemowym oknie, a **Zapisz i zastosuj** waliduje dane przed przeładowaniem działającej synchronizacji. W sekcji **Uruchamianie** można niezależnie włączyć start programu po zalogowaniu do Windows oraz automatyczny start synchronizacji po otwarciu programu. Pola zaawansowane, których formularz nie pokazuje (m.in. baza danych, lista pól API i mapowania własnych pól), pozostają bez zmian; przycisk otwierający pełny `config.json` znajduje się wewnątrz okna ustawień. Pozycja **Otwórz logi** wyświetla natywne okno z czytelnym podglądem ostatnich wpisów, odświeżanym na żywo bez uruchamiania Notatnika.
 
+![Okno ustawień Procyon Syncer](assets/app-screen.png)
+
 ---
 
 ## Struktura konfiguracji

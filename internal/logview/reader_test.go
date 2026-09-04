@@ -22,16 +22,61 @@ func TestReaderFormatsNewEntriesAndSkipsUnchangedFile(t *testing.T) {
 	if !changed {
 		t.Fatal("first read should report a change")
 	}
-	for _, expected := range []string{"INF", "Synchronizacja działa", "main.go:10", "items=3"} {
+	for _, expected := range []string{"[INFO", "Synchronizacja działa", "• items: 3"} {
 		if !strings.Contains(text, expected) {
 			t.Fatalf("formatted log missing %q: %q", expected, text)
 		}
+	}
+	if strings.Contains(text, "main.go:10") {
+		t.Fatalf("user-facing log should not contain source location: %q", text)
 	}
 
 	if text, changed, err := reader.Read(); err != nil {
 		t.Fatal(err)
 	} else if changed || text != "" {
 		t.Fatalf("unchanged file should not be returned again: changed=%v text=%q", changed, text)
+	}
+}
+
+func TestReaderFormatsErrorAsUserFacingMessage(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "app.log")
+	raw := `{"level":"error","time":"2026-09-04T10:00:00+02:00","caller":"main.go:192","error":"brak integracji \"importer\" w configu","message":"Błąd okna ustawień"}` + "\n"
+	if err := os.WriteFile(path, []byte(raw), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	text, _, err := NewReader(path, 1024).Read()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, expected := range []string{"[BŁĄD]", "Błąd okna ustawień", "— Brakuje ustawień importera w konfiguracji"} {
+		if !strings.Contains(text, expected) {
+			t.Fatalf("friendly error log missing %q: %q", expected, text)
+		}
+	}
+	if strings.Contains(text, "main.go:192") || strings.Contains(text, "error=") {
+		t.Fatalf("friendly error log contains technical decoration: %q", text)
+	}
+}
+
+func TestReaderTranslatesCommonTechnicalMessages(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "app.log")
+	raw := `{"level":"info","time":"2026-09-04T10:00:00+02:00","caller":"main.go:88","db":"C:\\pcm2www.db","driver":"sqlite","message":"DB ready"}` + "\n"
+	if err := os.WriteFile(path, []byte(raw), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	text, _, err := NewReader(path, 1024).Read()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, expected := range []string{"Baza danych gotowa", `• plik bazy: C:\pcm2www.db`, "• silnik bazy: sqlite"} {
+		if !strings.Contains(text, expected) {
+			t.Fatalf("translated log missing %q: %q", expected, text)
+		}
+	}
+	if strings.Contains(text, "DB ready") || strings.Contains(text, "main.go:88") {
+		t.Fatalf("translated log contains technical message: %q", text)
 	}
 }
 

@@ -6,11 +6,51 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/rs/zerolog"
 )
+
+var fieldLabels = map[string]string{
+	"archived_path": "archiwum",
+	"code":          "kod HTTP",
+	"db":            "plik bazy",
+	"dir":           "katalog",
+	"driver":        "silnik bazy",
+	"file":          "plik",
+	"import_id":     "import",
+	"integration":   "integracja",
+	"kind":          "operacja",
+	"page":          "strona",
+	"reason":        "powód",
+	"removed":       "usunięte",
+	"retry_in":      "ponowienie za",
+	"shop":          "sklep",
+	"status":        "status",
+	"task_id":       "zadanie",
+	"tasks":         "zadania",
+	"upserts":       "zmienione",
+}
+
+var messageTranslations = map[string]string{
+	"DB ready":                               "Baza danych gotowa",
+	"start":                                  "Integracja uruchomiona",
+	"stop":                                   "Integracja zatrzymana",
+	"syncer started":                         "Synchronizacja uruchomiona",
+	"syncer stopped":                         "Synchronizacja zatrzymana",
+	"syncer configuration reloaded":          "Konfiguracja synchronizacji przeładowana",
+	"integration stopped with error":         "Integracja zatrzymana z błędem",
+	"recovered interrupted Woo tasks":        "Przywrócono przerwane zadania WooCommerce",
+	"Woo cache primed (products)":            "Pobrano cache produktów WooCommerce",
+	"cache sweeper disabled (interval <= 0)": "Automatyczne odświeżanie cache jest wyłączone",
+}
+
+var errorTranslations = map[string]string{
+	`brak integracji "importer" w configu`: "Brakuje ustawień importera w konfiguracji",
+	`syncer: initialize integration "woocommerce": woocommerce: configure real consumer_key and consumer_secret`: "Nie można uruchomić WooCommerce: uzupełnij prawidłowy Consumer key i Consumer secret",
+}
 
 // Reader returns a bounded, human-readable snapshot of the newest log entries.
 // It skips disk reads when the file size and modification time did not change.
@@ -79,8 +119,19 @@ func format(raw []byte) string {
 	console := zerolog.ConsoleWriter{
 		Out:          &output,
 		NoColor:      true,
-		TimeFormat:   "2006-01-02 15:04:05",
+		TimeFormat:   "02.01.2006 15:04:05",
 		TimeLocation: time.Local,
+		PartsOrder: []string{
+			zerolog.TimestampFieldName,
+			zerolog.LevelFieldName,
+			zerolog.MessageFieldName,
+		},
+		FormatLevel:         formatLevel,
+		FormatMessage:       formatMessage,
+		FormatFieldName:     formatFieldName,
+		FormatFieldValue:    formatValue,
+		FormatErrFieldName:  func(any) string { return "— " },
+		FormatErrFieldValue: formatError,
 	}
 
 	scanner := bufio.NewScanner(bytes.NewReader(raw))
@@ -101,4 +152,57 @@ func format(raw []byte) string {
 
 	text := strings.TrimRight(output.String(), "\r\n")
 	return strings.ReplaceAll(text, "\n", "\r\n")
+}
+
+func formatLevel(value any) string {
+	var label string
+	switch strings.ToLower(fmt.Sprint(value)) {
+	case "trace":
+		label = "ŚLAD"
+	case "debug":
+		label = "DEBUG"
+	case "info":
+		label = "INFO"
+	case "warn", "warning":
+		label = "UWAGA"
+	case "error":
+		label = "BŁĄD"
+	case "fatal", "panic":
+		label = "KRYTYCZNY"
+	default:
+		label = "LOG"
+	}
+	return fmt.Sprintf("%-11s", "["+label+"]")
+}
+
+func formatFieldName(value any) string {
+	name := fmt.Sprint(value)
+	if friendly, ok := fieldLabels[name]; ok {
+		name = friendly
+	}
+	return "• " + name + ": "
+}
+
+func formatValue(value any) string {
+	text := fmt.Sprint(value)
+	if unquoted, err := strconv.Unquote(text); err == nil {
+		return unquoted
+	}
+	return text
+}
+
+func formatMessage(value any) string {
+	message := formatValue(value)
+	if friendly, ok := messageTranslations[message]; ok {
+		return friendly
+	}
+	return message
+}
+
+func formatError(value any) string {
+	errorText := formatValue(value)
+	if friendly, ok := errorTranslations[errorText]; ok {
+		return friendly
+	}
+	return errorText
 }
