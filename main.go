@@ -113,7 +113,7 @@ func main() {
 		mStop.Disable()
 
 		systray.AddSeparator()
-		mOpenLogs := systray.AddMenuItem("Otwórz logi", "Pokaż plik log")
+		mOpenLogs := systray.AddMenuItem("Otwórz logi", "Pokaż logi na żywo")
 		mSettings := systray.AddMenuItem("Ustawienia…", "Otwórz okno ustawień")
 		mReload := systray.AddMenuItem("Przeładuj konfigurację", "Wczytaj ponownie config.json")
 		systray.AddSeparator()
@@ -151,8 +151,9 @@ func main() {
 					systray.SetTooltip(fmt.Sprintf("Procyon Syncer %s — zatrzymane", ver))
 
 				case <-mOpenLogs.ClickedCh:
-					if err := openInExplorer(filepath.Join(appDir, "app.log")); err != nil {
-						log.Error().Err(err).Msg("Nie można otworzyć logów")
+					if err := showLogWindow(filepath.Join(appDir, "app.log")); err != nil {
+						log.Error().Err(err).Msg("Nie można otworzyć okna logów")
+						messageBox("Procyon Syncer — logi", err.Error())
 					}
 
 				case <-mSettings.ClickedCh:
