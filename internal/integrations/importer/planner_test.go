@@ -211,8 +211,8 @@ func TestPlanWooTasksCanSendNetPrices(t *testing.T) {
 		Kod:         "5901234567891",
 		Nazwa:       "Net Price Product",
 		VatID:       2300,
-		CenaDetal:   123,
-		CenaHurtowa: 61.5,
+		CenaDetal:   100,
+		CenaHurtowa: 50,
 		AktywnyWSI:  true,
 	}).Error; err != nil {
 		t.Fatal(err)

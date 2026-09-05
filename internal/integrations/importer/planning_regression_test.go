@@ -25,7 +25,7 @@ func linkedPlanner(t *testing.T) (*Importer, *gorm.DB) {
 		&db.ImportFile{ImportID: 3, SHA256: "three", Status: 1},
 		&db.StProduct{TowarID: 42, ImportID: 1, Kod: "5901234567890", CenaDetal: 10, CenaHurtowa: 8, VatID: 2300},
 		&db.StStock{TowarID: 42, MagazynID: 1, Stan: 10},
-		&db.WooProductCache{WooID: 900, Ean: "5901234567890", PriceRegular: 10, HurtPrice: 8, TaxClass: "2300", StockQty: 10, StockManaged: true, StockStatus: "instock", Backorders: "notify", CatalogVisibility: "visible"},
+		&db.WooProductCache{WooID: 900, Ean: "5901234567890", PriceRegular: 12.3, HurtPrice: 9.84, TaxClass: "2300", StockQty: 10, StockManaged: true, StockStatus: "instock", Backorders: "notify", CatalogVisibility: "visible"},
 	} {
 		if err := gdb.Create(row).Error; err != nil {
 			t.Fatal(err)
@@ -79,7 +79,7 @@ func TestPlannerReturningToCompletedPriceAdvancesRevision(t *testing.T) {
 		if err := gdb.Model(&task).Update("status", "done").Error; err != nil {
 			t.Fatal(err)
 		}
-		if err := gdb.Model(&db.WooProductCache{}).Where("woo_id = ?", 900).Update("price_regular", price).Error; err != nil {
+		if err := gdb.Model(&db.WooProductCache{}).Where("woo_id = ?", 900).Update("price_regular", imp.wooPriceFromNet(price, 2300)).Error; err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -409,7 +409,7 @@ func TestPlannerRefreshesLegacyPendingPriceAgainstCompletedHistory(t *testing.T)
 	if err := gdb.Model(&db.StProduct{}).Where("towar_id = ?", 42).Update("cena_detal", 20).Error; err != nil {
 		t.Fatal(err)
 	}
-	old := db.WooTask{TaskKey: buildTaskKey(db.WooTaskKindPriceUpdate, 900, normalizeFloatKey(20), normalizeFloatKey(8), "2300"), Kind: db.WooTaskKindPriceUpdate, WooID: ptrUint(900), TowarID: ptrInt64(42), Status: "pending"}
+	old := db.WooTask{TaskKey: buildTaskKey(db.WooTaskKindPriceUpdate, 900, normalizeFloatKey(24.6), normalizeFloatKey(9.84), "2300"), Kind: db.WooTaskKindPriceUpdate, WooID: ptrUint(900), TowarID: ptrInt64(42), Status: "pending"}
 	if err := gdb.Create(&old).Error; err != nil {
 		t.Fatal(err)
 	}
@@ -430,7 +430,7 @@ func TestPlannerRefreshesLegacyPendingPriceAgainstCompletedHistory(t *testing.T)
 	if err := json.Unmarshal([]byte(current.PayloadJSON), &payload); err != nil {
 		t.Fatal(err)
 	}
-	if payload.DesiredRegular != 20 {
+	if payload.DesiredRegular != 24.6 {
 		t.Fatalf("legacy payload not refreshed from linked staging: %+v", payload)
 	}
 }

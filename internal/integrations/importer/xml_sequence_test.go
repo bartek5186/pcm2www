@@ -137,7 +137,7 @@ func TestImportRealXMLSequenceIntoIsolatedDB(t *testing.T) {
 		final = after
 
 		if !grossPricePlanned {
-			grossPricePlanned = assertPlannerUsesGrossStagingPrice(t, gdb, imp, importFile.ImportID)
+			grossPricePlanned = assertPlannerConvertsNetStagingPrice(t, gdb, imp, importFile.ImportID)
 		}
 
 		// Każdy XML jest osobną klatką stanu. Porównanie całej bazy po każdym
@@ -755,7 +755,7 @@ func assertExpectedImportState(t *testing.T, gdb *gorm.DB, expected expectedImpo
 	assertNoDuplicateImportRows(t, gdb)
 }
 
-func assertPlannerUsesGrossStagingPrice(t *testing.T, gdb *gorm.DB, imp *Importer, importID uint) bool {
+func assertPlannerConvertsNetStagingPrice(t *testing.T, gdb *gorm.DB, imp *Importer, importID uint) bool {
 	t.Helper()
 
 	var product db.StProduct
@@ -799,11 +799,18 @@ func assertPlannerUsesGrossStagingPrice(t *testing.T, gdb *gorm.DB, imp *Importe
 	if err := json.Unmarshal([]byte(task.PayloadJSON), &payload); err != nil {
 		t.Fatal(err)
 	}
-	if !sameTestFloat(payload.DesiredRegular, product.CenaDetal) {
-		t.Fatalf("price.update should use gross staging cena_detal unchanged: got %v want %v", payload.DesiredRegular, product.CenaDetal)
+	// Independent VAT calculation: the staging values remain net.
+	vat := float64(product.VatID) / 10000
+	if product.VatID == -1 {
+		vat = 0
 	}
-	if !sameTestFloat(payload.DesiredHurt, product.CenaHurtowa) {
-		t.Fatalf("price.update should use gross staging cena_hurtowa unchanged: got %v want %v", payload.DesiredHurt, product.CenaHurtowa)
+	wantRegular := math.Round(product.CenaDetal*(1+vat)*100) / 100
+	wantHurt := math.Round(product.CenaHurtowa*(1+vat)*100) / 100
+	if !sameTestFloat(payload.DesiredRegular, wantRegular) {
+		t.Fatalf("price.update should convert net cena_detal to gross: got %v want %v", payload.DesiredRegular, wantRegular)
+	}
+	if !sameTestFloat(payload.DesiredHurt, wantHurt) {
+		t.Fatalf("price.update should convert net cena_hurtowa to gross: got %v want %v", payload.DesiredHurt, wantHurt)
 	}
 	return true
 }

@@ -77,8 +77,12 @@ Integracja składa się z trzech głównych sekcji:
 
 `integrations.importer.price_mode` określa, jaką cenę planner wysyła do WooCommerce:
 
-- `"gross"` – domyślnie; wysyła ceny brutto z PC-Market bez przeliczania.
-- `"net"` – przelicza ceny brutto z PC-Market na netto według `vat_id`.
+- `"gross"` – domyślnie; dolicza VAT według `vat_id` do cen netto z XML, zaokrąglając wynik do dwóch miejsc. Wybierz, gdy WooCommerce ma ustawione wpisywanie cen z podatkiem.
+- `"net"` – wysyła ceny netto z XML bez przeliczania. Wybierz, gdy WooCommerce ma ustawione wpisywanie cen bez podatku.
+
+Dotyczy to `cena_detal` i `cena_hurtowa`. Przykład: `40.64` netto przy `vat_id=2300` daje `49.99` brutto. Ustawienie nie zmienia konfiguracji podatków ani sposobu wyświetlania cen w WooCommerce.
+
+Starsze wersje błędnie zakładały, że ceny w XML są brutto. Po aktualizacji uruchom synchronizację z właściwym trybem cen: planner ponownie porówna już zapisane dane z cache Woo i zaplanuje korekty dla powiązanych produktów. Nie trzeba resetować bazy ani ponownie importować XML. Produkty z aktywną promocją nadal są pomijane przy aktualizacji ceny.
 - **auto_start, sync_interval_seconds** – parametry globalne
 
 ## Baza danych
@@ -176,7 +180,7 @@ Worker działa w tle i przetwarza kolejkę zadań atomicznie (claim → execute 
 | `price.update` | Aktualizacja ceny regularnej, hurtowej i klasy podatkowej (`tax_class`) | Skip jeśli `cena_detal=0` lub `do_usuniecia=Y`; skip jeśli aktywna `sale_price > 0`; skip jeśli cena i klasa podatkowa już się zgadzają |
 | `availability.update` | Zarządzanie dostępnością produktu w sklepie | Skip jeśli stan w Woo już jest zgodny z oczekiwanym |
 
-`price.update` używa `integrations.importer.price_mode`: domyślne `"gross"` wysyła ceny brutto z PC-Market, a `"net"` przelicza je na netto przed utworzeniem taska.
+`price.update` używa `integrations.importer.price_mode`: domyślne `"gross"` dolicza VAT do cen netto z PC-Market, a `"net"` przekazuje ceny netto bez przeliczenia.
 
 **Logika dostępności i flag PCM:**
 

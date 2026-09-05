@@ -427,24 +427,26 @@ func normalizePriceMode(mode string) (string, error) {
 	}
 }
 
-func (i *Importer) wooPriceFromGross(gross float64, vatID int64) float64 {
+// PC-Market exports cena_detal and cena_hurtowa as net prices. PriceMode
+// selects the amount Woo expects, not the type of the source price.
+func (i *Importer) wooPriceFromNet(net float64, vatID int64) float64 {
 	mode, err := normalizePriceMode(i.cfg.PriceMode)
-	if err != nil || mode == priceModeGross {
-		return gross
+	if err == nil && mode == priceModeNet {
+		return net
 	}
 	rate := vatIDToRate(vatID)
 	if rate == 0 {
-		return gross
+		return net
 	}
-	return math.Round((gross/(1+rate))*100) / 100
+	return math.Round((net*(1+rate))*100) / 100
 }
 
 func (i *Importer) planPriceUpdateTask(tx *gorm.DB, importID uint, src plannerSourceRow, cache plannerCacheRow) (created, requeued, existed, skipped bool, err error) {
 	if !sourceProductEligible(src) || floatAlmostEqual(src.CenaDetal, 0) {
 		return false, false, false, false, nil // produkt niedostępny (brak ceny) — nie ustawiaj ceny 0
 	}
-	desiredRegular := i.wooPriceFromGross(src.CenaDetal, src.VatID)
-	desiredHurt := i.wooPriceFromGross(src.CenaHurtowa, src.VatID)
+	desiredRegular := i.wooPriceFromNet(src.CenaDetal, src.VatID)
+	desiredHurt := i.wooPriceFromNet(src.CenaHurtowa, src.VatID)
 	desiredTaxClass := vatIDToTaxClass(src.VatID)
 	taskKey := buildTaskKey(db.WooTaskKindPriceUpdate, cache.WooID, normalizeFloatKey(desiredRegular), normalizeFloatKey(desiredHurt), desiredTaxClass)
 	if err := supersedeOtherWooTasks(tx, cache.WooID, db.WooTaskKindPriceUpdate, taskKey); err != nil {
