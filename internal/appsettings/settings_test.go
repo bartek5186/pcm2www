@@ -41,6 +41,8 @@ func TestApplyPreservesAdvancedAndUnrelatedConfiguration(t *testing.T) {
 
 	updated, err := Apply(base, Values{
 		AutoStart:               true,
+		WooEnabled:              true,
+		ImportEnabled:           true,
 		WooBaseURL:              " https://new.example.com ",
 		WooConsumerKey:          " new-key ",
 		WooConsumerSecret:       " new-secret ",
@@ -88,9 +90,27 @@ func TestApplyPreservesAdvancedAndUnrelatedConfiguration(t *testing.T) {
 	}
 }
 
-func TestFromConfigRejectsMissingRequiredIntegration(t *testing.T) {
-	_, err := FromConfig(&conf.Config{Integrations: map[string]json.RawMessage{}})
-	if err == nil {
-		t.Fatal("missing integrations should be reported")
+func TestFromConfigAllowsAbsentIntegrations(t *testing.T) {
+	values, err := FromConfig(&conf.Config{Integrations: map[string]json.RawMessage{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if values.WooEnabled || values.ImportEnabled {
+		t.Fatal("absent integrations must be disabled")
+	}
+}
+
+func TestPartialDisabledConfigurationRoundTrips(t *testing.T) {
+	base := &conf.Config{Database: conf.DBConfig{Driver: "sqlite"}}
+	updated, err := Apply(base, Values{WooBaseURL: "https://shop.example", ImportPriceMode: "gross"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	values, err := FromConfig(updated)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if values.WooEnabled || values.ImportEnabled || values.WooBaseURL != "https://shop.example" || values.WooConsumerSecret != "" {
+		t.Fatalf("partial disabled settings not preserved: %+v", values)
 	}
 }

@@ -58,6 +58,9 @@ func TestUpdateConfigKeepsOriginalParentContext(t *testing.T) {
 		t.Fatal(err)
 	}
 	second := receiveStartedContext(t, started)
+	if parent.Err() != nil || second.Err() != nil {
+		t.Fatal("reload canceled the application or new integration context")
+	}
 	if first == second {
 		t.Fatal("config reload should create a new integration context")
 	}
@@ -201,5 +204,55 @@ func receiveStartedContext(t *testing.T, started <-chan context.Context) context
 	case <-time.After(time.Second):
 		t.Fatal("integration did not start")
 		return nil
+	}
+}
+
+func TestDisabledIntegrationDoesNotRequireCredentials(t *testing.T) {
+	s := New(zerolog.Nop(), &conf.Config{Integrations: map[string]json.RawMessage{
+		"woocommerce": json.RawMessage(`{"enabled":false,"base_url":"","consumer_key":""}`),
+		"importer":    json.RawMessage(`{"enabled":false,"watch_dir":""}`),
+	}}, nil)
+	ints, err := s.buildIntegrations(s.cfg)
+	if err != nil || len(ints) != 0 {
+		t.Fatalf("disabled integrations were constructed: %v %v", ints, err)
+	}
+	if err := s.Start(context.Background()); err == nil {
+		t.Fatal("nothing enabled must not start an empty run")
+	}
+}
+
+func TestStoppedSyncerAcceptsDraftButStartValidates(t *testing.T) {
+	s := New(zerolog.Nop(), &conf.Config{}, nil)
+	draft := &conf.Config{Integrations: map[string]json.RawMessage{"woocommerce": json.RawMessage(`{"base_url":"https://shop.example"}`)}}
+	if err := s.UpdateConfig(draft); err != nil {
+		t.Fatal(err)
+	}
+	if s.cfg != draft || s.IsRunning() {
+		t.Fatal("draft save changed lifecycle")
+	}
+	if err := s.Start(context.Background()); err == nil {
+		t.Fatal("incomplete enabled integration was started")
+	}
+}
+
+func TestDisablingAllIntegrationsKeepsApplicationContextAlive(t *testing.T) {
+	const name = "disable_all_test"
+	started := make(chan context.Context, 1)
+	integrations.Register(name, func(zerolog.Logger, json.RawMessage) (integrations.Integration, error) {
+		return &lifecycleTestIntegration{started: started}, nil
+	})
+	s := New(zerolog.Nop(), &conf.Config{Integrations: map[string]json.RawMessage{name: json.RawMessage(`{}`)}}, nil)
+	parent, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := s.Start(parent); err != nil {
+		t.Fatal(err)
+	}
+	defer s.Stop()
+	run := receiveStartedContext(t, started)
+	if err := s.UpdateConfig(&conf.Config{Integrations: map[string]json.RawMessage{name: json.RawMessage(`{"enabled":false}`)}}); err != nil {
+		t.Fatal(err)
+	}
+	if s.IsRunning() || run.Err() == nil || parent.Err() != nil {
+		t.Fatal("disabling integrations must stop only their run")
 	}
 }

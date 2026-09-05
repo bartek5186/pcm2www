@@ -82,6 +82,9 @@ func (s *Syncer) startLocked(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	if len(ints) == 0 {
+		return fmt.Errorf("syncer: brak włączonych integracji")
+	}
 	return s.startPreparedLocked(ctx, ints)
 }
 
@@ -141,15 +144,19 @@ func (s *Syncer) buildIntegrations(cfg *conf.Config) ([]runningInt, error) {
 	if cfg == nil {
 		return nil, fmt.Errorf("syncer: nil config")
 	}
-	if len(cfg.Integrations) == 0 {
-		return nil, fmt.Errorf("syncer: no integrations configured")
-	}
 	names := make([]string, 0, len(cfg.Integrations))
 	for name := range cfg.Integrations {
 		names = append(names, name)
 	}
 	sort.Strings(names)
 	for _, name := range names {
+		enabled, err := cfg.IntegrationEnabled(name)
+		if err != nil {
+			return nil, err
+		}
+		if !enabled {
+			continue
+		}
 		raw := cfg.Integrations[name]
 
 		f, ok := integrations.Get(name)
@@ -242,18 +249,18 @@ func (s *Syncer) UpdateConfig(cfg *conf.Config) error {
 	if isRunning && oldCfg != nil && !reflect.DeepEqual(oldCfg.Database, cfg.Database) {
 		return fmt.Errorf("syncer: zmiana konfiguracji bazy wymaga restartu aplikacji")
 	}
-	ints, err := s.buildIntegrations(cfg)
-	if err != nil {
-		return err
-	}
-	if isRunning && (parent == nil || parent.Err() != nil) {
-		return fmt.Errorf("syncer: cannot reload using canceled parent context")
-	}
 	if !isRunning {
 		s.mu.Lock()
 		s.cfg = cfg
 		s.mu.Unlock()
 		return nil
+	}
+	ints, err := s.buildIntegrations(cfg)
+	if err != nil {
+		return err
+	}
+	if parent == nil || parent.Err() != nil {
+		return fmt.Errorf("syncer: cannot reload using canceled parent context")
 	}
 
 	s.stopLocked()
@@ -266,6 +273,9 @@ func (s *Syncer) UpdateConfig(cfg *conf.Config) error {
 	s.mu.Lock()
 	s.cfg = cfg
 	s.mu.Unlock()
+	if len(ints) == 0 {
+		return nil
+	} // saving with everything disabled stops only synchronization
 	if err := s.startPreparedLocked(parent, ints); err != nil {
 		s.mu.Lock()
 		s.cfg = oldCfg

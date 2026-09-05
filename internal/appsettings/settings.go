@@ -13,7 +13,9 @@ import (
 // Values contains the part of config.json edited by the Windows settings UI.
 // Fields not represented here (database and custom-field mappings) are preserved.
 type Values struct {
-	AutoStart bool
+	AutoStart     bool
+	WooEnabled    bool
+	ImportEnabled bool
 
 	WooBaseURL              string
 	WooConsumerKey          string
@@ -35,11 +37,11 @@ func FromConfig(cfg *conf.Config) (Values, error) {
 	}
 
 	var woo woocommerce.Config
-	if err := cfg.UnmarshalIntegration("woocommerce", &woo); err != nil {
+	if err := unmarshalOptional(cfg, "woocommerce", &woo); err != nil {
 		return Values{}, err
 	}
 	var imp importer.Config
-	if err := cfg.UnmarshalIntegration("importer", &imp); err != nil {
+	if err := unmarshalOptional(cfg, "importer", &imp); err != nil {
 		return Values{}, err
 	}
 
@@ -48,8 +50,18 @@ func FromConfig(cfg *conf.Config) (Values, error) {
 		priceMode = "gross"
 	}
 
+	wooEnabled, err := cfg.IntegrationEnabled("woocommerce")
+	if err != nil {
+		return Values{}, err
+	}
+	importEnabled, err := cfg.IntegrationEnabled("importer")
+	if err != nil {
+		return Values{}, err
+	}
 	return Values{
-		AutoStart: cfg.AutoStart,
+		AutoStart:     cfg.AutoStart,
+		WooEnabled:    wooEnabled,
+		ImportEnabled: importEnabled,
 
 		WooBaseURL:              woo.BaseURL,
 		WooConsumerKey:          woo.ConsumerKey,
@@ -72,14 +84,16 @@ func Apply(base *conf.Config, values Values) (*conf.Config, error) {
 	}
 
 	var woo woocommerce.Config
-	if err := base.UnmarshalIntegration("woocommerce", &woo); err != nil {
+	if err := unmarshalOptional(base, "woocommerce", &woo); err != nil {
 		return nil, err
 	}
 	var imp importer.Config
-	if err := base.UnmarshalIntegration("importer", &imp); err != nil {
+	if err := unmarshalOptional(base, "importer", &imp); err != nil {
 		return nil, err
 	}
 
+	woo.Enabled = &values.WooEnabled
+	imp.Enabled = &values.ImportEnabled
 	woo.BaseURL = strings.TrimSpace(values.WooBaseURL)
 	woo.ConsumerKey = strings.TrimSpace(values.WooConsumerKey)
 	woo.ConsumerSec = strings.TrimSpace(values.WooConsumerSecret)
@@ -114,4 +128,11 @@ func Apply(base *conf.Config, values Values) (*conf.Config, error) {
 		return nil, err
 	}
 	return &updated, nil
+}
+
+func unmarshalOptional(cfg *conf.Config, name string, dst any) error {
+	if _, ok := cfg.Integrations[name]; !ok {
+		return nil
+	}
+	return cfg.UnmarshalIntegration(name, dst)
 }

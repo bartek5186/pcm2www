@@ -8,6 +8,22 @@ import (
 	"testing"
 )
 
+func TestOptionalIntegrationsRemainOptionalAfterLoad(t *testing.T) {
+	for _, raw := range []string{`{}`, `{"woocommerce":{"enabled":false}}`, `{"woocommerce":{"enabled":true}}`} {
+		path := filepath.Join(t.TempDir(), "config.json")
+		if err := os.WriteFile(path, []byte(`{"database":{"driver":"sqlite"},"integrations":`+raw+`}`), 0600); err != nil {
+			t.Fatal(err)
+		}
+		cfg, _, err := LoadOrCreate(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, ok := cfg.Integrations["importer"]; ok {
+			t.Fatal("optional importer was silently enabled")
+		}
+	}
+}
+
 func TestFirstRunConfigIsCompleteAndDoesNotAutoStart(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.json")
 	cfg, created, err := LoadOrCreate(path)

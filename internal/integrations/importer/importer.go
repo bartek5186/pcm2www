@@ -26,6 +26,7 @@ import (
 )
 
 type Config struct {
+	Enabled          *bool  `json:"enabled,omitempty"`           // interpreted by syncer before construction
 	WatchDir         string `json:"watch_dir"`                   // np. ~/pcm2www/imports
 	PollSec          int    `json:"poll_sec"`                    // np. 5-10s w dev
 	PriceMode        string `json:"price_mode,omitempty"`        // gross (domyślnie) albo net

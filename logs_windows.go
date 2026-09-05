@@ -16,7 +16,7 @@ import (
 
 const logViewerMaxBytes = 512 << 10
 
-func showLogWindow(logPath string, s *syncer.Syncer) error {
+func showLogWindow(logPath string, s *syncer.Syncer) (*walk.Dialog, error) {
 	initialStatus := s.Status()
 	indicatorColor, _ := statusAppearance(initialStatus.State)
 	reader := logview.NewReader(logPath, logViewerMaxBytes)
@@ -94,11 +94,7 @@ func showLogWindow(logPath string, s *syncer.Syncer) error {
 	}
 
 	if err := logDialog.Create(nil); err != nil {
-		return fmt.Errorf("tworzenie okna logów: %w", err)
-	}
-	if icon, iconErr := walk.NewIconFromResourceId(2); iconErr == nil {
-		defer icon.Dispose()
-		_ = dialog.SetIcon(icon)
+		return nil, fmt.Errorf("tworzenie okna logów: %w", err)
 	}
 	scrollLogToEnd(logText)
 
@@ -109,7 +105,7 @@ func showLogWindow(logPath string, s *syncer.Syncer) error {
 		closed.Store(true)
 		stopOnce.Do(func() { close(done) })
 	}
-	dialog.Closing().Once(func(_ *bool, _ walk.CloseReason) { stop() })
+	dialog.Disposing().Once(stop)
 
 	go func() {
 		lastStatus := initialStatus
@@ -157,9 +153,8 @@ func showLogWindow(logPath string, s *syncer.Syncer) error {
 		}
 	}()
 
-	dialog.Run()
-	stop()
-	return nil
+	showModelessDialog(dialog)
+	return dialog, nil
 }
 
 func scrollLogToEnd(text *walk.TextEdit) {

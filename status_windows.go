@@ -3,28 +3,30 @@
 package main
 
 import (
-	_ "embed"
+	"sync"
 
 	"github.com/bartek5186/pcm2www/internal/syncer"
+	"github.com/bartek5186/pcm2www/internal/trayicon"
 	"github.com/lxn/walk"
+	"github.com/lxn/win"
 )
 
-//go:embed assets/status-running.ico
-var runningStatusIcon []byte
-
-//go:embed assets/status-starting.ico
-var startingStatusIcon []byte
-
-//go:embed assets/status-stopped.ico
-var stoppedStatusIcon []byte
+var statusIcons sync.Map
 
 func statusAppearance(state syncer.StatusState) (walk.Color, []byte) {
+	color := walk.RGB(190, 48, 48)
 	switch state {
 	case syncer.StatusRunning:
-		return walk.RGB(36, 145, 74), runningStatusIcon
+		color = walk.RGB(36, 145, 74)
 	case syncer.StatusStarting:
-		return walk.RGB(178, 116, 0), startingStatusIcon
-	default:
-		return walk.RGB(190, 48, 48), stoppedStatusIcon
+		color = walk.RGB(178, 116, 0)
 	}
+	key := [2]uint32{uint32(color), statusMenuBackground()}
+	icon, ok := statusIcons.Load(key)
+	if !ok {
+		icon, _ = statusIcons.LoadOrStore(key, trayicon.DotICO(key[0], key[1]))
+	}
+	return color, icon.([]byte)
 }
+
+func statusMenuBackground() uint32 { return win.GetSysColor(win.COLOR_MENU) }

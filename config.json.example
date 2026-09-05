@@ -6,6 +6,7 @@
   },
   "integrations": {
     "woocommerce": {
+      "enabled": true,
       "base_url": "https://…",
       "consumer_key": "ck_xxx",
       "consumer_secret": "GGoO .... ....",
@@ -17,6 +18,7 @@
       }
     },
     "importer": {
+      "enabled": true,
       "watch_dir": "~/pcm2www/imports",
       "poll_sec": 5,
 	  "price_mode": "gross",

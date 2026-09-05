@@ -167,6 +167,14 @@ func migrateLegacyConfig(cfg *Config) (bool, error) {
 	if _, hasImporter := cfg.Integrations["importer"]; hasImporter {
 		return false, nil
 	}
+	// An explicit enabled flag identifies a modern, deliberately optional
+	// integration setup. Do not add an importer the user did not enable.
+	var wooFields map[string]json.RawMessage
+	if json.Unmarshal(cfg.Integrations["woocommerce"], &wooFields) == nil {
+		if _, modern := wooFields["enabled"]; modern {
+			return false, nil
+		}
+	}
 
 	rawImporter, err := json.Marshal(defaultImporterConfig(cfg.WatchDir))
 	if err != nil {
@@ -188,23 +196,51 @@ func (c *Config) Validate() error {
 	if c.SyncIntervalSeconds < 0 {
 		return fmt.Errorf("sync_interval_seconds nie może być ujemne")
 	}
-	if len(c.Integrations) == 0 {
-		return fmt.Errorf("brak integracji w konfiguracji")
+	for name := range c.Integrations {
+		if _, err := c.IntegrationEnabled(name); err != nil {
+			return err
+		}
 	}
 	return nil
 }
 
+// An absent integration is disabled. Older configurations without "enabled"
+// keep their existing behaviour (enabled when present).
+func (c *Config) IntegrationEnabled(name string) (bool, error) {
+	raw, ok := c.Integrations[name]
+	if !ok {
+		return false, nil
+	}
+	var flags struct {
+		Enabled *bool `json:"enabled"`
+	}
+	if err := json.Unmarshal(raw, &flags); err != nil {
+		return false, fmt.Errorf("integracja %s: %w", name, err)
+	}
+	return flags.Enabled == nil || *flags.Enabled, nil
+}
+
 func Save(path string, cfg *Config) error {
-	_ = os.MkdirAll(filepath.Dir(path), 0o755)
-	f, err := os.Create(path)
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	f, err := os.CreateTemp(filepath.Dir(path), ".config-*.json")
 	if err != nil {
 		return err
 	}
-	defer f.Close()
+	defer os.Remove(f.Name())
 
 	enc := json.NewEncoder(f)
 	enc.SetIndent("", "  ")
-	return enc.Encode(cfg)
+	encodeErr := enc.Encode(cfg)
+	closeErr := f.Close()
+	if encodeErr != nil {
+		return encodeErr
+	}
+	if closeErr != nil {
+		return closeErr
+	}
+	return os.Rename(f.Name(), path)
 }
 
 // Helper do odczytu konkretnej integracji do struktury docelowej

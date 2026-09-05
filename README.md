@@ -21,7 +21,16 @@ Integrator działa cyklicznie, pobiera dane z katalogu eksportów PC-Market (`ex
 Integrator posiada narzędzie CLI (Linux/Mac) oraz aplikację z systray (Windows).
 Plik konfiguracyjny: `~/.config/pcm2www/config.json`
 
-W wersji Windows pozycja **Ustawienia…** w menu ikony otwiera natywny formularz do konfiguracji WooCommerce, importu XML, cache i automatycznego startu integracji. Sekret Woo jest domyślnie zamaskowany, katalog eksportów można wybrać w systemowym oknie, a **Zapisz i zastosuj** waliduje dane przed przeładowaniem działającej synchronizacji. W sekcji **Uruchamianie** można niezależnie włączyć start programu po zalogowaniu do Windows oraz automatyczny start synchronizacji po otwarciu programu. Pola zaawansowane, których formularz nie pokazuje (m.in. baza danych, lista pól API i mapowania własnych pól), pozostają bez zmian; przycisk otwierający pełny `config.json` znajduje się wewnątrz okna ustawień. Pozycja **Otwórz logi** wyświetla natywne okno z czytelnym podglądem ostatnich wpisów, odświeżanym na żywo bez uruchamiania Notatnika. Nad logami oraz na górze menu traya znajduje się wskaźnik synchronizacji: zielony oznacza uruchomione integracje i gotowy cache Woo, żółty — uruchamianie, czerwony — zatrzymanie lub błąd. Stan odświeża się również bez nowych wpisów w logu; kliknięcie statusu w trayu otwiera logi, a wskazanie lampki w oknie pokazuje szczegóły. Okresowe wpisy `syncer heartbeat` zostały zastąpione wskaźnikiem; historyczne wpisy tego typu są pomijane w podglądzie. Czerwony stan synchronizacji może być widoczny przy nadal otwartej aplikacji.
+W wersji Windows pozycja **Ustawienia…** w menu ikony otwiera natywny formularz do konfiguracji WooCommerce, importu XML, cache i automatycznego startu integracji. Sekret Woo jest domyślnie zamaskowany, katalog eksportów można wybrać w systemowym oknie, a **Zapisz i zastosuj** pozwala zapisać niepełne ustawienia, gdy synchronizacja jest zatrzymana; przy działającej synchronizacji najpierw waliduje włączone integracje. Każda integracja ma osobny przełącznik włączenia, a wyłączona zachowuje wpisane dane i nie wymaga kompletu pól. Zapis oraz przeładowanie odbywają się w tle. Ustawienia, logi i raport problemów mogą być otwarte jednocześnie; ponowny wybór okna w trayu przywołuje je na pierwszy plan. Zamknięcie okna nie zamyka aplikacji. W sekcji **Uruchamianie** można niezależnie włączyć start programu po zalogowaniu do Windows oraz automatyczny start synchronizacji po otwarciu programu. Pola zaawansowane, których formularz nie pokazuje (m.in. baza danych, lista pól API i mapowania własnych pól), pozostają bez zmian; przycisk otwierający pełny `config.json` znajduje się wewnątrz okna ustawień. Pozycja **Otwórz logi** wyświetla natywne okno z czytelnym podglądem ostatnich wpisów, odświeżanym na żywo bez uruchamiania Notatnika. Nad logami oraz na górze menu traya znajduje się wskaźnik synchronizacji: zielony oznacza uruchomione integracje i gotowy cache Woo, żółty — uruchamianie, czerwony — zatrzymanie lub błąd. Stan odświeża się również bez nowych wpisów w logu; kliknięcie statusu w trayu otwiera logi, a wskazanie lampki w oknie pokazuje szczegóły. Okresowe wpisy `syncer heartbeat` zostały zastąpione wskaźnikiem; historyczne wpisy tego typu są pomijane w podglądzie. Czerwony stan synchronizacji może być widoczny przy nadal otwartej aplikacji.
+
+Pozycja **Analityka** w menu traya otwiera widok bieżących problemów. Obejmuje brak EAN w PCM i WooCommerce, brak dopasowania po obu stronach, duplikaty EAN, błędy i ponowienia aktualizacji, pominięte zadania z podanym powodem, błędy importu XML i zatrzymane z błędem integracje. Błędy starszych zadań zastąpionych nowszym zadaniem nie są pokazywane jako bieżące.
+
+**Odśwież** odczytuje lokalną bazę bez wywoływania API sklepu i ponownie wylicza diagnostykę EAN; aktualność danych sklepu zależy od ostatniej udanej synchronizacji cache. Widok pokazuje czas odczytu i liczbę rekordów PCM/Woo. Można filtrować kategorię i szukać po nazwie, kodzie, identyfikatorze, pliku lub treści błędu. Zaznaczenie wiersza pokazuje szczegóły, a dwuklik lub przyciski otwierają produkt i jego edycję w WooCommerce. Link edycji wymaga zalogowania do WordPressa; produkt niepubliczny może nie otworzyć się w publicznym sklepie.
+
+**Eksportuj CSV…** zapisuje dokładnie widoczne wiersze z danego odczytu, w UTF-8 z BOM, separatorem `;`, nazwami produktów, kodami/EAN, identyfikatorami, opisem problemu oraz linkami. Aby wyeksportować wszystko, wybierz **Wszystkie** i wyczyść wyszukiwanie. W Excelu importuj kolumny kod/EAN jako tekst, aby zachować zera na początku. Dane przypominające formuły są zabezpieczane przed wykonaniem przez arkusz. Raport nie zmienia produktów ani powiązań.
+
+Ikona statusu w menu używa natywnej bitmapy ICO z tłem w systemowym kolorze menu, co usuwa czarne tło powstające podczas rysowania przezroczystych ikon przez bibliotekę traya.
+
 
 ![Okno ustawień Procyon Syncer](assets/app-screen.png)
 
@@ -85,6 +94,10 @@ Dotyczy to `cena_detal` i `cena_hurtowa`. Przykład: `40.64` netto przy `vat_id=
 Starsze wersje błędnie zakładały, że ceny w XML są brutto. Po aktualizacji uruchom synchronizację z właściwym trybem cen: planner ponownie porówna już zapisane dane z cache Woo i zaplanuje korekty dla powiązanych produktów. Nie trzeba resetować bazy ani ponownie importować XML. Produkty z aktywną promocją nadal są pomijane przy aktualizacji ceny.
 - **auto_start, sync_interval_seconds** – parametry globalne
 
+Każda sekcja w `integrations` może zawierać `"enabled": false`, aby zachować ustawienia bez uruchamiania integracji. Brak sekcji oznacza integrację wyłączoną; w starszych konfiguracjach brak pola `enabled` w istniejącej sekcji oznacza `true`. Można zapisać konfigurację bez żadnej włączonej integracji. Przycisk Start sprawdza kompletność włączonych integracji i wymaga przynajmniej jednej. Wyłączenie wszystkich w czasie pracy zatrzymuje synchronizację, a aplikacja pozostaje w trayu.
+
+Niepełne ustawienia włączonej integracji można zapisać po zatrzymaniu synchronizacji. Zapis przy działającej synchronizacji odrzuca niepoprawną konfigurację przed zatrzymaniem bieżących integracji. Jeśli w czasie edycji użyto przeładowania z pliku, formularz należy otworzyć ponownie, aby nie nadpisać nowszych ustawień.
+
 ## Baza danych
 
 Sekcja `database` pozwala przełączać backend danych:
@@ -117,7 +130,7 @@ Przykłady:
 
 ## Parametry globalne
 
-- **auto_start** – określa, czy po uruchomieniu procesu aplikacja ma od razu wystartować wszystkie integracje zapisane w `integrations`. `true` uruchamia importer, cache i workery bez klikania/komendy `start`; `false` uruchamia tylko CLI lub ikonę w trayu i czeka na ręczny start. Osobna opcja **Uruchamiaj Procyon Syncer po zalogowaniu do Windows** rejestruje aplikację w autostarcie bieżącego użytkownika Windows; nie jest zapisywana w tym pliku JSON.
+- **auto_start** – określa, czy po uruchomieniu procesu aplikacja ma od razu wystartować włączone integracje zapisane w `integrations`. `true` uruchamia importer, cache i workery bez klikania/komendy `start`; `false` uruchamia tylko CLI lub ikonę w trayu i czeka na ręczny start. Osobna opcja **Uruchamiaj Procyon Syncer po zalogowaniu do Windows** rejestruje aplikację w autostarcie bieżącego użytkownika Windows; nie jest zapisywana w tym pliku JSON.
 - **sync_interval_seconds** – interwał wewnętrznego heartbeat syncera. Nie zastępuje `poll_sec` importera ani workera.
 
 ### Pierwsze uruchomienie
@@ -315,3 +328,5 @@ Cache Woo odświeżany jest niezależnie:
 | Tworzenie nowych produktów w Woo | NIEGOTOWE |
 | Import innych typów eksportów PCM | NIEGOTOWE |
 | Pobieranie zamówień z Woo | NIEGOTOWE |
+
+Test natywnych okien na Windows (interaktywny pulpit, bez połączeń ze sklepem): ustaw `PCM2WWW_WINDOWS_UI_TESTS=1` i uruchom `go test -run TestWindowsSettingsAndLogsStayIndependent .`. Sprawdza zapis niepełnych ustawień, otwarcie logów podczas zapisu oraz dalsze działanie interfejsu po zamknięciu formularza.

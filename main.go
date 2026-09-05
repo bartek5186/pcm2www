@@ -11,16 +11,20 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 	"unsafe"
 
+	"github.com/bartek5186/pcm2www/internal/appsettings"
 	conf "github.com/bartek5186/pcm2www/internal/config"
 	"github.com/bartek5186/pcm2www/internal/db"
 	logs "github.com/bartek5186/pcm2www/internal/logs"
 	"github.com/bartek5186/pcm2www/internal/singleinstance"
 	syncer "github.com/bartek5186/pcm2www/internal/syncer"
 	"github.com/getlantern/systray"
+	"github.com/lxn/walk"
 )
 
 //go:embed assets/favicon.ico
@@ -95,6 +99,14 @@ func main() {
 	defer cancel()
 
 	s := syncer.New(log, cfg, dbh.DB)
+	var configState atomic.Pointer[conf.Config]
+	configState.Store(cfg)
+	var configChangeMu sync.Mutex
+	uiHost, err := startWindowsUI(ctx, log)
+	if err != nil {
+		messageBox("Procyon Syncer — interfejs", err.Error())
+		return
+	}
 
 	go func() {
 		<-ctx.Done()
@@ -113,25 +125,35 @@ func main() {
 
 		systray.AddSeparator()
 		mOpenLogs := systray.AddMenuItem("Otwórz logi", "Pokaż logi na żywo")
+		mProblems := systray.AddMenuItem("Analityka", "Aktualne braki EAN, błędy i linki do produktów")
 		mSettings := systray.AddMenuItem("Ustawienia…", "Otwórz okno ustawień")
 		mReload := systray.AddMenuItem("Przeładuj konfigurację", "Wczytaj ponownie config.json")
 		systray.AddSeparator()
 		mAbout := systray.AddMenuItem(fmt.Sprintf("Procyon Syncer %s", ver), "O programie")
 		mQuit := systray.AddMenuItem("Wyjście", "Zamknij aplikację")
 
+		var logWindow, settingsWindow, problemsWindow *walk.Dialog // UI thread only
 		openLogs := func() {
-			if err := showLogWindow(filepath.Join(appDir, "app.log"), s); err != nil {
+			if raiseDialog(logWindow) {
+				return
+			}
+			var err error
+			logWindow, err = showLogWindow(filepath.Join(appDir, "app.log"), s)
+			if err != nil {
 				log.Error().Err(err).Msg("Nie można otworzyć okna logów")
 				messageBox("Procyon Syncer — logi", err.Error())
 			}
 		}
 		var previousStatus syncer.StatusSnapshot
+		var previousMenuColor uint32
 		refreshStatus := func() {
 			status := s.Status()
-			if status == previousStatus {
+			menuColor := statusMenuBackground()
+			if status == previousStatus && menuColor == previousMenuColor {
 				return
 			}
 			previousStatus = status
+			previousMenuColor = menuColor
 			_, statusIcon := statusAppearance(status.State)
 			mStatus.SetTitle(status.Text)
 			mStatus.SetIcon(statusIcon)
@@ -145,8 +167,7 @@ func main() {
 			}
 		}
 		refreshStatus()
-		// Modal settings/log windows block the menu action loop. Keep status
-		// updates independent so integration failures remain visible there too.
+		// Status polling stays independent of configuration reloads and UI work.
 		go func() {
 			ticker := time.NewTicker(time.Second)
 			defer ticker.Stop()
@@ -175,58 +196,81 @@ func main() {
 				case <-ctx.Done():
 					return
 				case <-mStart.ClickedCh:
-					if err := s.Start(ctx); err != nil {
-						log.Error().Msgf("Start error: %v", err)
-						continue
-					}
+					go func() {
+						if err := s.Start(ctx); err != nil {
+							log.Error().Msgf("Start error: %v", err)
+						}
+					}()
 
 				case <-mStop.ClickedCh:
-					s.Stop()
+					go s.Stop()
 
 				case <-mStatus.ClickedCh:
-					openLogs()
+					dispatchUI(uiHost, log, openLogs)
 
 				case <-mOpenLogs.ClickedCh:
-					openLogs()
+					dispatchUI(uiHost, log, openLogs)
+
+				case <-mProblems.ClickedCh:
+					dispatchUI(uiHost, log, func() {
+						if raiseDialog(problemsWindow) {
+							return
+						}
+						var wooConfig struct {
+							BaseURL string `json:"base_url"`
+						}
+						if err := configState.Load().UnmarshalIntegration("woocommerce", &wooConfig); err != nil {
+							log.Warn().Err(err).Msg("Raport problemów: brak adresu sklepu do linków")
+						}
+						var err error
+						problemsWindow, err = showProblemsWindow(ctx, dbh.DB, wooConfig.BaseURL, s)
+						if err != nil {
+							log.Error().Err(err).Msg("Nie można otworzyć raportu problemów")
+							messageBox("Procyon Syncer — problemy", err.Error())
+						}
+					})
 
 				case <-mSettings.ClickedCh:
-					updatedCfg, err := showSettingsWindow(cfg, cfgPath, func(candidate *conf.Config) error {
-						if err := s.ValidateConfig(candidate); err != nil {
-							return err
+					dispatchUI(uiHost, log, func() {
+						if raiseDialog(settingsWindow) {
+							return
 						}
-						if err := conf.Save(cfgPath, candidate); err != nil {
-							return fmt.Errorf("zapis config.json: %w", err)
-						}
-						if err := s.UpdateConfig(candidate); err != nil {
-							if rollbackErr := conf.Save(cfgPath, cfg); rollbackErr != nil {
-								return fmt.Errorf("zastosowanie konfiguracji: %v; przywrócenie pliku: %w", err, rollbackErr)
+						base := configState.Load()
+						var err error
+						settingsWindow, err = showSettingsWindow(base, cfgPath, func(candidate *conf.Config) error {
+							configChangeMu.Lock()
+							defer configChangeMu.Unlock()
+							if configState.Load() != base {
+								return fmt.Errorf("konfiguracja została przeładowana; otwórz ustawienia ponownie")
 							}
-							return fmt.Errorf("zastosowanie konfiguracji: %w", err)
+							if err := appsettings.SaveAndApply(cfgPath, base, candidate, s); err != nil {
+								log.Error().Err(err).Msg("Nie zapisano ustawień")
+								return err
+							}
+							configState.Store(candidate)
+							return nil
+						}, func(*conf.Config) { log.Info().Msg("Ustawienia zapisane i zastosowane") })
+						if err != nil {
+							log.Error().Err(err).Msg("Błąd okna ustawień")
+							messageBox("Procyon Syncer — ustawienia", err.Error())
 						}
-						return nil
 					})
-					if err != nil {
-						log.Error().Err(err).Msg("Błąd okna ustawień")
-						messageBox("Procyon Syncer — ustawienia", err.Error())
-						continue
-					}
-					if updatedCfg != nil {
-						cfg = updatedCfg
-						log.Info().Msg("Ustawienia zapisane i zastosowane")
-					}
 
 				case <-mReload.ClickedCh:
-					newCfg, _, err := conf.LoadOrCreate(cfgPath)
-					if err != nil {
-						log.Error().Msgf("Błąd reloadu: %v", err)
-						continue
-					}
-					if err := s.UpdateConfig(newCfg); err != nil {
-						log.Error().Err(err).Msg("Błąd zastosowania konfiguracji")
-						continue
-					}
-					cfg = newCfg
-					log.Info().Msg("Konfiguracja przeładowana")
+					go func() {
+						configChangeMu.Lock()
+						defer configChangeMu.Unlock()
+						newCfg, _, err := conf.LoadOrCreate(cfgPath)
+						if err == nil {
+							err = s.UpdateConfig(newCfg)
+						}
+						if err != nil {
+							log.Error().Err(err).Msg("Błąd przeładowania konfiguracji")
+							return
+						}
+						configState.Store(newCfg)
+						log.Info().Msg("Konfiguracja przeładowana")
+					}()
 
 				case <-mAbout.ClickedCh:
 					msg := fmt.Sprintf(

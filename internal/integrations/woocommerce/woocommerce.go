@@ -22,7 +22,8 @@ type WooCache struct {
 }
 
 type Config struct {
-	BaseURL      string              `json:"base_url"` // https://shop.example.com
+	Enabled      *bool               `json:"enabled,omitempty"` // interpreted by syncer before construction
+	BaseURL      string              `json:"base_url"`          // https://shop.example.com
 	ConsumerKey  string              `json:"consumer_key"`
 	ConsumerSec  string              `json:"consumer_secret"`
 	PollSec      int                 `json:"poll_sec"` // co ile sekund worker sprawdza kolejkę

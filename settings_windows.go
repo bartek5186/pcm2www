@@ -12,7 +12,7 @@ import (
 	ui "github.com/lxn/walk/declarative"
 )
 
-func showSettingsWindow(current *conf.Config, configPath string, apply func(*conf.Config) error) (*conf.Config, error) {
+func showSettingsWindow(current *conf.Config, configPath string, apply func(*conf.Config) error, saved func(*conf.Config)) (*walk.Dialog, error) {
 	values, err := appsettings.FromConfig(current)
 	if err != nil {
 		return nil, err
@@ -42,7 +42,9 @@ func showSettingsWindow(current *conf.Config, configPath string, apply func(*con
 		statusLabel    *walk.Label
 		saveButton     *walk.PushButton
 		cancelButton   *walk.PushButton
-		result         *conf.Config
+		wooEnabled     *walk.CheckBox
+		importEnabled  *walk.CheckBox
+		saving         bool
 	)
 
 	priceModeIndex := 0
@@ -53,8 +55,8 @@ func showSettingsWindow(current *conf.Config, configPath string, apply func(*con
 	settingsDialog := ui.Dialog{
 		AssignTo:      &dialog,
 		Title:         "Procyon Syncer — ustawienia",
-		Size:          ui.Size{Width: 720, Height: 600},
-		MinSize:       ui.Size{Width: 680, Height: 580},
+		Size:          ui.Size{Width: 760, Height: 690},
+		MinSize:       ui.Size{Width: 720, Height: 670},
 		FixedSize:     true,
 		Font:          ui.Font{Family: "Segoe UI", PointSize: 9},
 		DefaultButton: &saveButton,
@@ -69,12 +71,13 @@ func showSettingsWindow(current *conf.Config, configPath string, apply func(*con
 				Font: ui.Font{Family: "Segoe UI", PointSize: 13, Bold: true},
 			},
 			ui.Label{
-				Text: "Zmień podstawowe parametry. Pozostałe ustawienia zaawansowane pozostaną bez zmian.",
+				Text: "Niepełne ustawienia można zapisać przy zatrzymanej synchronizacji. Uruchamiane są tylko włączone integracje.",
 			},
 			ui.GroupBox{
 				Title:  "WooCommerce",
 				Layout: ui.Grid{Columns: 2, Spacing: 8},
 				Children: []ui.Widget{
+					ui.CheckBox{AssignTo: &wooEnabled, Text: "Włącz integrację WooCommerce", Checked: values.WooEnabled, ColumnSpan: 2},
 					ui.Label{Text: "Adres sklepu:"},
 					ui.LineEdit{
 						AssignTo:  &baseURLEdit,
@@ -162,6 +165,7 @@ func showSettingsWindow(current *conf.Config, configPath string, apply func(*con
 				Title:  "Import PC-Market",
 				Layout: ui.Grid{Columns: 2, Spacing: 8},
 				Children: []ui.Widget{
+					ui.CheckBox{AssignTo: &importEnabled, Text: "Włącz import PC-Market", Checked: values.ImportEnabled, ColumnSpan: 2},
 					ui.Label{Text: "Katalog plików XML:"},
 					ui.Composite{
 						Layout: ui.HBox{MarginsZero: true, Spacing: 8},
@@ -253,6 +257,9 @@ func showSettingsWindow(current *conf.Config, configPath string, apply func(*con
 						Text:        "Otwórz config.json…",
 						ToolTipText: "Zamyka formularz i otwiera pełny plik konfiguracyjny.",
 						OnClicked: func() {
+							if saving {
+								return
+							}
 							answer := walk.MsgBox(
 								dialog,
 								"Pełna konfiguracja",
@@ -292,6 +299,8 @@ func showSettingsWindow(current *conf.Config, configPath string, apply func(*con
 							}
 							candidate, err := appsettings.Apply(current, appsettings.Values{
 								AutoStart:               autoStart.Checked(),
+								WooEnabled:              wooEnabled.Checked(),
+								ImportEnabled:           importEnabled.Checked(),
 								WooBaseURL:              baseURLEdit.Text(),
 								WooConsumerKey:          consumerKey.Text(),
 								WooConsumerSecret:       consumerSecret.Text(),
@@ -304,29 +313,53 @@ func showSettingsWindow(current *conf.Config, configPath string, apply func(*con
 								ImportStabilitySeconds:  int(stability.Value()),
 								ImportPriceMode:         mode,
 							})
-							startupChanged := startupReadErr == nil && startAtLogin.Checked() != windowsStartup
-							startupApplied := false
-							if err == nil && startupChanged {
-								err = setWindowsStartupEnabled(startAtLogin.Checked())
-								startupApplied = err == nil
-							}
-							if err == nil {
-								err = apply(candidate)
-							}
 							if err != nil {
-								if startupApplied {
-									if rollbackErr := setWindowsStartupEnabled(windowsStartup); rollbackErr != nil {
-										err = fmt.Errorf("%v; dodatkowo nie udało się przywrócić autostartu Windows: %w", err, rollbackErr)
-									}
-								}
 								statusLabel.SetText("Nie zapisano ustawień: " + err.Error())
 								saveButton.SetEnabled(true)
-								walk.MsgBox(dialog, "Nie można zapisać ustawień", err.Error(), walk.MsgBoxIconError)
 								return
 							}
-
-							result = candidate
-							dialog.Accept()
+							saving = true
+							dialog.SetEnabled(false)
+							cancelButton.SetEnabled(false)
+							requestedStartup := startAtLogin.Checked()
+							startupChanged := startupReadErr == nil && requestedStartup != windowsStartup
+							go func() {
+								var applyErr error
+								startupApplied := false
+								defer func() {
+									if r := recover(); r != nil {
+										applyErr = fmt.Errorf("błąd zastosowania ustawień: %v", r)
+									}
+									if applyErr != nil && startupApplied {
+										if rollbackErr := setWindowsStartupEnabled(windowsStartup); rollbackErr != nil {
+											applyErr = fmt.Errorf("%v; przywrócenie autostartu: %w", applyErr, rollbackErr)
+										}
+									}
+									dialog.Synchronize(func() {
+										if dialog.IsDisposed() {
+											return
+										}
+										saving = false
+										dialog.SetEnabled(true)
+										saveButton.SetEnabled(true)
+										cancelButton.SetEnabled(true)
+										if applyErr != nil {
+											statusLabel.SetText("Nie zapisano ustawień: " + applyErr.Error())
+											walk.MsgBox(dialog, "Nie można zapisać ustawień", applyErr.Error(), walk.MsgBoxIconError)
+											return
+										}
+										saved(candidate)
+										dialog.Accept()
+									})
+								}()
+								if startupChanged {
+									applyErr = setWindowsStartupEnabled(requestedStartup)
+									startupApplied = applyErr == nil
+								}
+								if applyErr == nil {
+									applyErr = apply(candidate)
+								}
+							}()
 						},
 					},
 				},
@@ -337,11 +370,11 @@ func showSettingsWindow(current *conf.Config, configPath string, apply func(*con
 	if err := settingsDialog.Create(nil); err != nil {
 		return nil, fmt.Errorf("tworzenie okna ustawień: %w", err)
 	}
-	// resource.syso contains manifest ID 1 and the application icon group ID 2.
-	if icon, iconErr := walk.NewIconFromResourceId(2); iconErr == nil {
-		defer icon.Dispose()
-		_ = dialog.SetIcon(icon)
-	}
-	dialog.Run()
-	return result, nil
+	dialog.Closing().Attach(func(cancel *bool, _ walk.CloseReason) {
+		if saving {
+			*cancel = true
+		}
+	})
+	showModelessDialog(dialog)
+	return dialog, nil
 }
