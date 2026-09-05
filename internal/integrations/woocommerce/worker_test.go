@@ -919,3 +919,44 @@ func toUint64(v any) (uint64, bool) {
 		return 0, false
 	}
 }
+
+func TestWorkerSkipsPromotionWithNumericSalePrice(t *testing.T) {
+	gdb := newWooWorkerTestDB(t)
+	wooID, sourceID := uint(301), int64(42)
+	seedWorkerLink(t, gdb, wooID, sourceID, "5901234567890")
+	payload, err := json.Marshal(db.WooPriceUpdatePayload{WooID: wooID, TowarID: sourceID, DesiredRegular: 20, DesiredHurt: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	task := db.WooTask{TaskKey: "numeric-sale", WooID: &wooID, TowarID: &sourceID, Kind: db.WooTaskKindPriceUpdate, PayloadJSON: string(payload), Status: "pending"}
+	if err := gdb.Create(&task).Error; err != nil {
+		t.Fatal(err)
+	}
+	reads, writes := 0, 0
+	w := &Woo{log: zerolog.Nop(), cfg: Config{BaseURL: "https://woo.test"}, http: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.Method != http.MethodGet {
+			writes++
+			return textResponse(500, "promotion must not be overwritten"), nil
+		}
+		reads++
+		return textResponse(200, `[{"id":301,"global_unique_id":"5901234567890","regular_price":15,"sale_price":8,"hurt_price":5}]`), nil
+	})}}
+	w.workerTick(context.Background(), gdb)
+	if reads != 1 || writes != 0 {
+		t.Fatalf("unexpected API calls: reads=%d writes=%d", reads, writes)
+	}
+	var current db.WooTask
+	if err := gdb.Where("task_id = ?", task.TaskID).Take(&current).Error; err != nil {
+		t.Fatal(err)
+	}
+	if current.Status != "skipped" || !strings.Contains(current.LastError, "sale_price") {
+		t.Fatalf("numeric promotion was not recognized: %+v", current)
+	}
+	var cache db.WooProductCache
+	if err := gdb.Where("woo_id = ?", wooID).Take(&cache).Error; err != nil {
+		t.Fatal(err)
+	}
+	if cache.PriceSale != 8 || cache.PriceRegular != 15 || cache.HurtPrice != 5 {
+		t.Fatalf("numeric prices were not cached: %+v", cache)
+	}
+}

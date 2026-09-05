@@ -2,6 +2,7 @@
 package woocommerce
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -20,8 +21,8 @@ type wcProduct struct {
 	GlobalUniqueID    string                     `json:"global_unique_id"`
 	EAN               string                     `json:"ean"`
 	Status            string                     `json:"status"`        // "publish","draft","trash"
-	RegularPrice      string                     `json:"regular_price"` // string w Woo
-	SalePrice         string                     `json:"sale_price"`    // string
+	RegularPrice      string                     `json:"regular_price"` // string lub liczba w API, normalizowane do string
+	SalePrice         string                     `json:"sale_price"`
 	HurtPrice         string                     `json:"hurt_price"`
 	TaxClass          string                     `json:"tax_class"`
 	ManageStock       bool                       `json:"manage_stock"`
@@ -45,8 +46,31 @@ func (p wcProduct) cacheEAN() string {
 func (p *wcProduct) UnmarshalJSON(data []byte) error {
 	type alias wcProduct
 	var decoded alias
-	if err := json.Unmarshal(data, &decoded); err != nil {
+	// Woo extensions can return prices as JSON numbers instead of strings.
+	// Shadow only these fields; keep normal type checking for the other data.
+	fields := struct {
+		*alias
+		RegularPrice json.RawMessage `json:"regular_price"`
+		SalePrice    json.RawMessage `json:"sale_price"`
+		HurtPrice    json.RawMessage `json:"hurt_price"`
+	}{alias: &decoded}
+	if err := json.Unmarshal(data, &fields); err != nil {
 		return err
+	}
+	for _, field := range []struct {
+		name string
+		raw  json.RawMessage
+		dest *string
+	}{
+		{"regular_price", fields.RegularPrice, &decoded.RegularPrice},
+		{"sale_price", fields.SalePrice, &decoded.SalePrice},
+		{"hurt_price", fields.HurtPrice, &decoded.HurtPrice},
+	} {
+		value, err := decodeWooPrice(field.raw)
+		if err != nil {
+			return fmt.Errorf("decode %s: %w", field.name, err)
+		}
+		*field.dest = value
 	}
 
 	var raw map[string]json.RawMessage
@@ -80,6 +104,24 @@ func (p *wcProduct) UnmarshalJSON(data []byte) error {
 	*p = wcProduct(decoded)
 	p.ExtraFields = raw
 	return nil
+}
+
+func decodeWooPrice(raw json.RawMessage) (string, error) {
+	raw = bytes.TrimSpace(raw)
+	if len(raw) == 0 || bytes.Equal(raw, []byte("null")) {
+		return "", nil
+	}
+	if raw[0] == '"' {
+		var value string
+		err := json.Unmarshal(raw, &value)
+		return value, err
+	}
+	// Preserve the decimal representation without a float64 round trip.
+	var value json.Number
+	if err := json.Unmarshal(raw, &value); err != nil {
+		return "", fmt.Errorf("expected a string, number or null: %w", err)
+	}
+	return value.String(), nil
 }
 
 func (p wcProduct) topLevelValue(key string) string {

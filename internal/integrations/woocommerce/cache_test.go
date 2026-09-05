@@ -3,6 +3,7 @@ package woocommerce
 import (
 	"context"
 	"net/http"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -153,5 +154,44 @@ func TestPrimeCacheRemovesProductsMissingFromWoo(t *testing.T) {
 	}
 	if len(ids) != 1 || ids[0] != 10 {
 		t.Fatalf("stale cache product was not removed: %v", ids)
+	}
+}
+
+func TestPrimeCacheAcceptsNumericPricesOnFourthPage(t *testing.T) {
+	gdb := newWooWorkerTestDB(t)
+	pages := 0
+	w := &Woo{log: zerolog.Nop(), cfg: Config{BaseURL: "https://woo.test"}, http: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		pages++
+		if r.Method != http.MethodGet || r.URL.Query().Get("page") != strconv.Itoa(pages) {
+			t.Fatalf("unexpected request: %s %s", r.Method, r.URL)
+		}
+		if pages > 4 {
+			t.Fatal("prime did not stop after last page")
+		}
+		if pages == 4 {
+			return jsonResponse(200, []map[string]any{{"id": 301, "global_unique_id": "5901234567890", "regular_price": 12.5, "sale_price": 9.5, "hurt_price": 7.5}})
+		}
+		products := make([]map[string]any, 100)
+		for index := range products {
+			products[index] = map[string]any{"id": (pages-1)*100 + index + 1, "regular_price": "10", "sale_price": "", "hurt_price": "8"}
+		}
+		return jsonResponse(200, products)
+	})}}
+	if err := w.primeCache(context.Background(), gdb); err != nil {
+		t.Fatal(err)
+	}
+	var count int64
+	if err := gdb.Model(&db.WooProductCache{}).Count(&count).Error; err != nil {
+		t.Fatal(err)
+	}
+	if pages != 4 || count != 301 {
+		t.Fatalf("incomplete prime: pages=%d products=%d", pages, count)
+	}
+	var last db.WooProductCache
+	if err := gdb.Where("woo_id = ?", 301).Take(&last).Error; err != nil {
+		t.Fatal(err)
+	}
+	if last.PriceRegular != 12.5 || last.PriceSale != 9.5 || last.HurtPrice != 7.5 || last.Ean != "5901234567890" {
+		t.Fatalf("numeric prices or EAN were lost: %+v", last)
 	}
 }
