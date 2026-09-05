@@ -160,6 +160,10 @@ func TestIntegrationFailureIsVisibleInStatus(t *testing.T) {
 	for time.Now().Before(deadline) {
 		statuses := s.IntegrationStatuses()
 		if len(statuses) == 1 && statuses[0].State == "failed" && strings.Contains(statuses[0].LastError, "forced") {
+			s.tickOnce()
+			if status := s.Status(); status.State != StatusError || !strings.Contains(status.Detail, "forced") {
+				t.Fatalf("heartbeat masked failed integration in visible status: %+v", status)
+			}
 			return
 		}
 		time.Sleep(time.Millisecond)

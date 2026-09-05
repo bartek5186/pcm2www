@@ -3,6 +3,7 @@ package logview
 import (
 	"bufio"
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -139,6 +140,15 @@ func format(raw []byte) string {
 	for scanner.Scan() {
 		line := bytes.TrimSuffix(scanner.Bytes(), []byte{'\r'})
 		if len(bytes.TrimSpace(line)) == 0 {
+			continue
+		}
+		// Older app versions wrote these periodically. Keep them out of the
+		// viewer as well; the live indicator now reports the current state.
+		var entry struct {
+			Level   string `json:"level"`
+			Message string `json:"message"`
+		}
+		if json.Unmarshal(line, &entry) == nil && entry.Level == "debug" && entry.Message == "syncer heartbeat" {
 			continue
 		}
 		if _, err := console.Write(line); err != nil {

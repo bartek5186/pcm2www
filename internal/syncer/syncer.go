@@ -41,8 +41,9 @@ type Syncer struct {
 	cancel          context.CancelFunc
 	parent          context.Context
 	wg              sync.WaitGroup // śledzi goroutines
-	ticks           uint64         // licznik heartbeatów
-	ints            []runningInt   // lista aktywnych integracji
+	lastHeartbeat   time.Time      // ostatni przebieg pętli, bez wpisów w logu
+	runtime         *integrations.Runtime
+	ints            []runningInt // lista aktywnych integracji
 	intStatus       map[string]IntegrationStatus
 	shutdownBlocked bool
 }
@@ -109,7 +110,8 @@ func (s *Syncer) startPreparedLocked(ctx context.Context, ints []runningInt) err
 	s.cancel = cancel
 	s.parent = parent
 	s.running = true
-	s.ticks = 0
+	s.lastHeartbeat = now
+	s.runtime = runtime
 	s.ints = ints
 	s.intStatus = statuses
 	s.wg.Add(1 + len(ints))
@@ -344,9 +346,6 @@ func (s *Syncer) loop(ctx context.Context) {
 
 func (s *Syncer) tickOnce() {
 	s.mu.Lock()
-	s.ticks++
-	n := s.ticks
+	s.lastHeartbeat = time.Now()
 	s.mu.Unlock()
-
-	s.log.Debug().Uint64("tick", n).Msg("syncer heartbeat")
 }

@@ -9,13 +9,16 @@ import (
 	"time"
 
 	"github.com/bartek5186/pcm2www/internal/logview"
+	"github.com/bartek5186/pcm2www/internal/syncer"
 	"github.com/lxn/walk"
 	ui "github.com/lxn/walk/declarative"
 )
 
 const logViewerMaxBytes = 512 << 10
 
-func showLogWindow(logPath string) error {
+func showLogWindow(logPath string, s *syncer.Syncer) error {
+	initialStatus := s.Status()
+	indicatorColor, _ := statusAppearance(initialStatus.State)
 	reader := logview.NewReader(logPath, logViewerMaxBytes)
 	initialText, _, initialErr := reader.Read()
 	if initialText == "" && initialErr == nil {
@@ -23,7 +26,7 @@ func showLogWindow(logPath string) error {
 	}
 
 	statusText := "Na żywo — oczekiwanie na nowe wpisy"
-	statusColor := walk.RGB(45, 115, 65)
+	statusColor := walk.RGB(90, 95, 105)
 	if initialErr != nil {
 		statusText = initialErr.Error()
 		statusColor = walk.RGB(170, 45, 35)
@@ -33,6 +36,8 @@ func showLogWindow(logPath string) error {
 		dialog      *walk.Dialog
 		logText     *walk.TextEdit
 		statusLabel *walk.Label
+		stateLabel  *walk.Label
+		stateLamp   *walk.Label
 		closeButton *walk.PushButton
 	)
 
@@ -51,6 +56,14 @@ func showLogWindow(logPath string) error {
 			ui.Label{
 				Text: "Ostatnie logi aplikacji",
 				Font: ui.Font{Family: "Segoe UI", PointSize: 13, Bold: true},
+			},
+			ui.Composite{
+				Layout: ui.HBox{MarginsZero: true, Spacing: 8},
+				Children: []ui.Widget{
+					ui.Label{AssignTo: &stateLamp, Text: "●", TextColor: indicatorColor, Font: ui.Font{Family: "Segoe UI Symbol", PointSize: 14}, ToolTipText: initialStatus.Detail},
+					ui.Label{AssignTo: &stateLabel, Text: initialStatus.Text, TextColor: indicatorColor, Font: ui.Font{Family: "Segoe UI", PointSize: 10, Bold: true}, ToolTipText: initialStatus.Detail},
+					ui.HSpacer{},
+				},
 			},
 			ui.TextEdit{
 				AssignTo:      &logText,
@@ -99,6 +112,7 @@ func showLogWindow(logPath string) error {
 	dialog.Closing().Once(func(_ *bool, _ walk.CloseReason) { stop() })
 
 	go func() {
+		lastStatus := initialStatus
 		ticker := time.NewTicker(750 * time.Millisecond)
 		defer ticker.Stop()
 		for {
@@ -107,17 +121,28 @@ func showLogWindow(logPath string) error {
 				return
 			case <-ticker.C:
 				text, changed, err := reader.Read()
-				if !changed && err == nil {
+				currentStatus := s.Status()
+				if !changed && err == nil && currentStatus == lastStatus {
 					continue
 				}
+				lastStatus = currentStatus
 				updatedText, updateErr := text, err
 				dialog.Synchronize(func() {
 					if closed.Load() {
 						return
 					}
+					color, _ := statusAppearance(currentStatus.State)
+					_ = stateLabel.SetText(currentStatus.Text)
+					stateLabel.SetTextColor(color)
+					stateLamp.SetTextColor(color)
+					_ = stateLabel.SetToolTipText(currentStatus.Detail)
+					_ = stateLamp.SetToolTipText(currentStatus.Detail)
 					if updateErr != nil {
 						statusLabel.SetText(updateErr.Error())
 						statusLabel.SetTextColor(walk.RGB(170, 45, 35))
+						return
+					}
+					if !changed {
 						return
 					}
 					if updatedText == "" {
@@ -126,7 +151,7 @@ func showLogWindow(logPath string) error {
 					_ = logText.SetText(updatedText)
 					scrollLogToEnd(logText)
 					statusLabel.SetText("Na żywo — zaktualizowano o " + time.Now().Format("15:04:05"))
-					statusLabel.SetTextColor(walk.RGB(45, 115, 65))
+					statusLabel.SetTextColor(walk.RGB(90, 95, 105))
 				})
 			}
 		}

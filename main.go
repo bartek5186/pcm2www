@@ -106,11 +106,10 @@ func main() {
 		if len(iconData) > 0 {
 			systray.SetIcon(iconData)
 		}
-		systray.SetTooltip(fmt.Sprintf("Procyon Syncer %s", ver))
-
+		mStatus := systray.AddMenuItem("Synchronizacja zatrzymana", "Otwórz logi i szczegóły stanu")
+		systray.AddSeparator()
 		mStart := systray.AddMenuItem("Start synchronizacji", "Uruchom harmonogram")
 		mStop := systray.AddMenuItem("Stop synchronizacji", "Zatrzymaj harmonogram")
-		mStop.Disable()
 
 		systray.AddSeparator()
 		mOpenLogs := systray.AddMenuItem("Otwórz logi", "Pokaż logi na żywo")
@@ -120,41 +119,75 @@ func main() {
 		mAbout := systray.AddMenuItem(fmt.Sprintf("Procyon Syncer %s", ver), "O programie")
 		mQuit := systray.AddMenuItem("Wyjście", "Zamknij aplikację")
 
-		if cfg.AutoStart {
-			if err := s.Start(ctx); err == nil {
+		openLogs := func() {
+			if err := showLogWindow(filepath.Join(appDir, "app.log"), s); err != nil {
+				log.Error().Err(err).Msg("Nie można otworzyć okna logów")
+				messageBox("Procyon Syncer — logi", err.Error())
+			}
+		}
+		var previousStatus syncer.StatusSnapshot
+		refreshStatus := func() {
+			status := s.Status()
+			if status == previousStatus {
+				return
+			}
+			previousStatus = status
+			_, statusIcon := statusAppearance(status.State)
+			mStatus.SetTitle(status.Text)
+			mStatus.SetIcon(statusIcon)
+			systray.SetTooltip(fmt.Sprintf("Procyon Syncer %s — %s", ver, status.Text))
+			if status.Active {
 				mStart.Disable()
 				mStop.Enable()
-				systray.SetTooltip(fmt.Sprintf("Procyon Syncer %s — działa", ver))
 			} else {
+				mStop.Disable()
+				mStart.Enable()
+			}
+		}
+		refreshStatus()
+		// Modal settings/log windows block the menu action loop. Keep status
+		// updates independent so integration failures remain visible there too.
+		go func() {
+			ticker := time.NewTicker(time.Second)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+					if ctx.Err() != nil {
+						return
+					}
+					refreshStatus()
+				}
+			}
+		}()
+
+		if cfg.AutoStart {
+			if err := s.Start(ctx); err != nil {
 				log.Error().Msgf("AutoStart nieudany: %v", err)
-				systray.SetTooltip(fmt.Sprintf("Procyon Syncer %s — błąd startu", ver))
 			}
 		}
 
 		go func() {
 			for {
 				select {
+				case <-ctx.Done():
+					return
 				case <-mStart.ClickedCh:
 					if err := s.Start(ctx); err != nil {
 						log.Error().Msgf("Start error: %v", err)
-						systray.SetTooltip(fmt.Sprintf("Procyon Syncer %s — błąd startu", ver))
 						continue
 					}
-					mStart.Disable()
-					mStop.Enable()
-					systray.SetTooltip(fmt.Sprintf("Procyon Syncer %s — działa", ver))
 
 				case <-mStop.ClickedCh:
 					s.Stop()
-					mStop.Disable()
-					mStart.Enable()
-					systray.SetTooltip(fmt.Sprintf("Procyon Syncer %s — zatrzymane", ver))
+
+				case <-mStatus.ClickedCh:
+					openLogs()
 
 				case <-mOpenLogs.ClickedCh:
-					if err := showLogWindow(filepath.Join(appDir, "app.log")); err != nil {
-						log.Error().Err(err).Msg("Nie można otworzyć okna logów")
-						messageBox("Procyon Syncer — logi", err.Error())
-					}
+					openLogs()
 
 				case <-mSettings.ClickedCh:
 					updatedCfg, err := showSettingsWindow(cfg, cfgPath, func(candidate *conf.Config) error {

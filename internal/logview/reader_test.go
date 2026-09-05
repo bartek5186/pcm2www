@@ -141,3 +141,16 @@ func TestReadTailStartsAtCompleteLine(t *testing.T) {
 		t.Fatalf("unexpected tail: %q", data)
 	}
 }
+
+func TestReaderHidesLegacyHeartbeatWithoutHidingErrors(t *testing.T) {
+	raw := `{"level":"debug","tick":1,"message":"syncer heartbeat"}` + "\n" +
+		`{"level":"error","message":"integration stopped with error","error":"decode page 4"}` + "\n" +
+		`{"level":"debug","message":"another debug message"}` + "\n"
+	text := format([]byte(raw))
+	if strings.Contains(text, "heartbeat") || strings.Contains(text, "tick") {
+		t.Fatalf("legacy heartbeat remains visible: %q", text)
+	}
+	if !strings.Contains(text, "decode page 4") || !strings.Contains(text, "another debug message") {
+		t.Fatalf("unrelated logs were hidden: %q", text)
+	}
+}
