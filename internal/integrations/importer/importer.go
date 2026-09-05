@@ -115,10 +115,19 @@ func (i *Importer) Start(ctx context.Context) error {
 	// pierwszy przebieg
 	i.scanOnce(dir)
 	ready := runtime.WooCacheReady()
-	if runtime.IsWooCacheReady() {
-		if err := i.linkAndPlanCurrentStaging(); err != nil {
-			return err
+	reconcileCurrent := true
+	reconcile := func() {
+		if !runtime.IsWooCacheReady() || !reconcileCurrent {
+			return
 		}
+		if err := i.linkAndPlanCurrentStaging(); err != nil {
+			i.log.Error().Err(err).Msg("startup link/plan failed; will retry next poll")
+			return
+		}
+		reconcileCurrent = false
+	}
+	if runtime.IsWooCacheReady() {
+		reconcile()
 		ready = nil
 	}
 
@@ -129,23 +138,38 @@ func (i *Importer) Start(ctx context.Context) error {
 			return nil
 		case <-ready:
 			ready = nil
-			if err := i.linkAndPlanCurrentStaging(); err != nil {
-				return fmt.Errorf("importer: link/plan after Woo cache readiness: %w", err)
-			}
+			reconcile()
 		case <-ticker.C:
 			i.scanOnce(dir)
+			reconcile()
 			ticker.Reset(i.interval())
 		}
 	}
 }
 
 func (i *Importer) linkAndPlanCurrentStaging() error {
+	// On startup reconcile current staging too, including databases predating
+	// PlanningPending. Persist the request before linking so failures are retried.
+	if err := i.db.Model(&db.ImportFile{}).
+		Where("status = ? AND import_id IN (?)", 1, i.db.Model(&db.StProduct{}).Select("import_id")).
+		Update("planning_pending", true).Error; err != nil {
+		return fmt.Errorf("mark current staging for planning: %w", err)
+	}
+	return i.planPendingImports()
+}
+
+func (i *Importer) planPendingImports() error {
+	var ids []uint
+	if err := i.db.Model(&db.ImportFile{}).
+		Where("status = ? AND planning_pending = ?", 1, true).
+		Order("import_id ASC").Pluck("import_id", &ids).Error; err != nil {
+		return fmt.Errorf("load pending planning imports: %w", err)
+	}
+	if len(ids) == 0 {
+		return nil
+	}
 	if err := i.LinkProductsByEAN(); err != nil {
 		return err
-	}
-	var ids []uint
-	if err := i.db.Model(&db.StProduct{}).Distinct().Order("import_id ASC").Pluck("import_id", &ids).Error; err != nil {
-		return fmt.Errorf("load current staging import ids: %w", err)
 	}
 	return i.PlanWooTasksForImports(ids)
 }
@@ -164,15 +188,16 @@ func (i *Importer) interval() time.Duration {
 }
 
 func (i *Importer) scanOnce(dir string) {
+	// Do not overwrite the staging history of an import whose planning failed.
+	// Resume its durable request before consuming another XML snapshot.
+	if !i.resumePlanning() {
+		return
+	}
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		i.log.Error().Err(err).Str("dir", dir).Msg("nie mogę odczytać katalogu")
 		return
 	}
-
-	processed := false
-	processedImportIDs := make([]uint, 0, 4)
-
 	for _, e := range entries {
 		if e.IsDir() {
 			continue
@@ -233,20 +258,26 @@ func (i *Importer) scanOnce(dir string) {
 		delete(i.observedFiles, full)
 
 		i.log.Info().Str("file", name).Str("archived_path", archivedPath).Uint("import_id", importID).Msg("przetworzono OK")
-		processed = true
-		processedImportIDs = append(processedImportIDs, importID)
-	}
-
-	if processed && (i.runtime == nil || i.runtime.IsWooCacheReady()) {
-		if err := i.LinkProductsByEAN(); err != nil {
-			i.log.Error().Err(err).Msg("LinkProductsByEAN failed after import")
+		if !i.resumePlanning() {
 			return
 		}
-		if err := i.PlanWooTasksForImports(processedImportIDs); err != nil {
-			i.log.Error().Err(err).Msg("PlanWooTasksForImports failed after import")
-		}
 	}
+}
 
+func (i *Importer) resumePlanning() bool {
+	if i.runtime != nil && !i.runtime.IsWooCacheReady() {
+		var pending int64
+		if err := i.db.Model(&db.ImportFile{}).Where("status = ? AND planning_pending = ?", 1, true).Count(&pending).Error; err != nil {
+			i.log.Error().Err(err).Msg("cannot check pending planning")
+			return false
+		}
+		return pending == 0
+	}
+	if err := i.planPendingImports(); err != nil {
+		i.log.Error().Err(err).Msg("link/plan pending imports failed; will retry next poll")
+		return false
+	}
+	return true
 }
 
 func (i *Importer) fileReady(path string) bool {
@@ -465,11 +496,12 @@ func (i *Importer) processFile(importID uint, fullPath string) error {
 				err := tx.Clauses(clause.OnConflict{
 					Columns: []clause.Column{{Name: "towar_id"}, {Name: "magazyn_id"}},
 					DoUpdates: clause.Assignments(map[string]interface{}{
-						"stan_prev":  gorm.Expr("stan"),
-						"stan":       gorm.Expr("excluded.stan"),
-						"rezerwacja": gorm.Expr("excluded.rezerwacja"),
-						"import_id":  gorm.Expr("excluded.import_id"),
-						"updated_at": gorm.Expr("CURRENT_TIMESTAMP"),
+						"stan_prev":       gorm.Expr("stan"),
+						"rezerwacja_prev": gorm.Expr("rezerwacja"),
+						"stan":            gorm.Expr("excluded.stan"),
+						"rezerwacja":      gorm.Expr("excluded.rezerwacja"),
+						"import_id":       gorm.Expr("excluded.import_id"),
+						"updated_at":      gorm.Expr("CURRENT_TIMESTAMP"),
 					}),
 				}).Create(&stockBatch).Error
 				if err != nil {
@@ -641,9 +673,10 @@ func (i *Importer) processFile(importID uint, fullPath string) error {
 
 		processedAt := time.Now()
 		if err := tx.Model(&db.ImportFile{}).Where("import_id = ?", importID).Updates(map[string]any{
-			"status":       1,
-			"last_error":   "",
-			"processed_at": processedAt,
+			"status":           1,
+			"last_error":       "",
+			"processed_at":     processedAt,
+			"planning_pending": true,
 		}).Error; err != nil {
 			return fmt.Errorf("mark import done: %w", err)
 		}

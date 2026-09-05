@@ -20,18 +20,19 @@ const (
 )
 
 type plannerSourceRow struct {
-	ImportID       uint
-	TowarID        int64
-	Kod            string
-	Nazwa          string
-	VatID          int64
-	CenaDetal      float64
-	CenaHurtowa    float64
-	AktywnyWSI     bool
-	DoUsuniecia    bool
-	TotalStock     float64
-	TotalReserved  float64
-	TotalStockPrev *float64 // NULL jeśli brak historii dla choć jednego magazynu
+	ImportID          uint
+	TowarID           int64
+	Kod               string
+	Nazwa             string
+	VatID             int64
+	CenaDetal         float64
+	CenaHurtowa       float64
+	AktywnyWSI        bool
+	DoUsuniecia       bool
+	TotalStock        float64
+	TotalReserved     float64
+	TotalReservedPrev float64
+	TotalStockPrev    *float64 // NULL jeśli brak historii dla choć jednego magazynu
 }
 
 type plannerCacheRow struct {
@@ -118,7 +119,11 @@ func (i *Importer) PlanWooTasks(importID uint) error {
 	if err := i.db.Transaction(func(tx *gorm.DB) error {
 		var err error
 		stats, err = i.planWooTasksTx(tx, importID)
-		return err
+		if err != nil {
+			return err
+		}
+		return tx.Model(&db.ImportFile{}).Where("import_id = ?", importID).
+			Update("planning_pending", false).Error
 	}); err != nil {
 		return err
 	}
@@ -209,7 +214,7 @@ func (i *Importer) planWooTasksTx(tx *gorm.DB, importID uint) (plannerStats, err
 			stats.DeletionMarkedProducts++
 		}
 		if !sourceProductEligible(row) || floatAlmostEqual(row.CenaDetal, 0) {
-			if err := supersedePendingWooTasks(tx, cache.WooID, []string{
+			if err := supersedeActiveWooTasks(tx, cache.WooID, []string{
 				db.WooTaskKindStockUpdate,
 				db.WooTaskKindPriceUpdate,
 			}, "source product is unavailable"); err != nil {
@@ -278,6 +283,7 @@ SELECT
 	p.do_usuniecia,
 	COALESCE(SUM(s.stan), 0) AS total_stock,
 	COALESCE(SUM(s.rezerwacja), 0) AS total_reserved,
+	COALESCE(SUM(COALESCE(s.rezerwacja_prev, s.rezerwacja)), 0) AS total_reserved_prev,
 	CASE WHEN COUNT(*) = COUNT(s.stan_prev) THEN SUM(s.stan_prev) ELSE NULL END AS total_stock_prev
 FROM st_products p
 LEFT JOIN st_stocks s ON s.towar_id = p.towar_id
@@ -295,7 +301,9 @@ GROUP BY
 ORDER BY p.towar_id;
 `
 	var rows []plannerSourceRow
-	return rows, tx.Raw(q, importID).Scan(&rows).Error
+	// The bundled SQLite driver treats whitespace after the semicolon as
+	// an empty second statement and returns SQLITE_MISUSE when reading rows.
+	return rows, tx.Raw(strings.TrimSpace(q), importID).Scan(&rows).Error
 }
 
 func loadPlannerCacheRows(tx *gorm.DB, towarIDs []int64) ([]plannerCacheRow, error) {
@@ -317,13 +325,17 @@ func (i *Importer) planStockUpdateTask(tx *gorm.DB, importID uint, src plannerSo
 		return false, false, false, false, nil // produkt niedostępny (brak ceny) — stock obsługuje availability.update
 	}
 	desiredStock := math.Max(src.TotalStock-src.TotalReserved, 0)
+	taskKey := buildTaskKey(db.WooTaskKindStockUpdate, cache.WooID, normalizeFloatKey(desiredStock))
+	if err := supersedeOtherWooTasks(tx, cache.WooID, db.WooTaskKindStockUpdate, taskKey); err != nil {
+		return false, false, false, false, err
+	}
 	if floatAlmostEqual(cache.StockQty, desiredStock) {
 		return false, false, false, false, nil
 	}
 	// Jeśli mamy historię PCM i efektywny stan się nie zmienił, nie nadpisuj Woo —
 	// różnica w cache może wynikać ze sprzedaży w sklepie (której PCM jeszcze nie zna).
 	if src.TotalStockPrev != nil {
-		prevNet := math.Max(*src.TotalStockPrev-src.TotalReserved, 0)
+		prevNet := math.Max(*src.TotalStockPrev-src.TotalReservedPrev, 0)
 		if floatAlmostEqual(desiredStock, prevNet) {
 			i.log.Debug().
 				Uint("import_id", importID).
@@ -360,7 +372,7 @@ func (i *Importer) planStockUpdateTask(tx *gorm.DB, importID uint, src plannerSo
 		SourceReserve: src.TotalReserved,
 	}
 	task := db.WooTask{
-		TaskKey:     buildTaskKey(db.WooTaskKindStockUpdate, cache.WooID, normalizeFloatKey(desiredStock)),
+		TaskKey:     taskKey,
 		ImportID:    importID,
 		TowarID:     ptrInt64(src.TowarID),
 		WooID:       ptrUint(cache.WooID),
@@ -434,6 +446,10 @@ func (i *Importer) planPriceUpdateTask(tx *gorm.DB, importID uint, src plannerSo
 	desiredRegular := i.wooPriceFromGross(src.CenaDetal, src.VatID)
 	desiredHurt := i.wooPriceFromGross(src.CenaHurtowa, src.VatID)
 	desiredTaxClass := vatIDToTaxClass(src.VatID)
+	taskKey := buildTaskKey(db.WooTaskKindPriceUpdate, cache.WooID, normalizeFloatKey(desiredRegular), normalizeFloatKey(desiredHurt), desiredTaxClass)
+	if err := supersedeOtherWooTasks(tx, cache.WooID, db.WooTaskKindPriceUpdate, taskKey); err != nil {
+		return false, false, false, false, err
+	}
 	if floatAlmostEqual(cache.PriceRegular, desiredRegular) && floatAlmostEqual(cache.HurtPrice, desiredHurt) && cache.TaxClass == desiredTaxClass {
 		return false, false, false, false, nil
 	}
@@ -463,7 +479,7 @@ func (i *Importer) planPriceUpdateTask(tx *gorm.DB, importID uint, src plannerSo
 		DesiredTaxClass: desiredTaxClass,
 	}
 	task := db.WooTask{
-		TaskKey:     buildTaskKey(db.WooTaskKindPriceUpdate, cache.WooID, normalizeFloatKey(desiredRegular), normalizeFloatKey(desiredHurt), desiredTaxClass),
+		TaskKey:     taskKey,
 		ImportID:    importID,
 		TowarID:     ptrInt64(src.TowarID),
 		WooID:       ptrUint(cache.WooID),
@@ -479,16 +495,6 @@ func (i *Importer) planAvailabilityUpdateTask(tx *gorm.DB, importID uint, src pl
 	unavailable := !sourceProductEligible(src) || floatAlmostEqual(src.CenaDetal, 0)
 	setStock := !unavailable && !cache.StockManaged
 	desiredStock := math.Max(src.TotalStock-src.TotalReserved, 0)
-
-	if unavailable {
-		if !cache.StockManaged && cache.StockStatus == "outofstock" && cache.CatalogVisibility == "hidden" {
-			return false, false, false, nil
-		}
-	} else {
-		if cache.StockManaged && cache.Backorders == "notify" && cache.CatalogVisibility != "hidden" {
-			return false, false, false, nil
-		}
-	}
 
 	stateKey := "available"
 	if unavailable {
@@ -509,8 +515,23 @@ func (i *Importer) planAvailabilityUpdateTask(tx *gorm.DB, importID uint, src pl
 	if setStock {
 		keyParts = append(keyParts, normalizeFloatKey(desiredStock))
 	}
+	taskKey := buildTaskKey(db.WooTaskKindAvailabilityUpdate, cache.WooID, keyParts...)
+	if err := supersedeOtherWooTasks(tx, cache.WooID, db.WooTaskKindAvailabilityUpdate, taskKey); err != nil {
+		return false, false, false, err
+	}
+
+	if unavailable {
+		if !cache.StockManaged && cache.StockStatus == "outofstock" && cache.CatalogVisibility == "hidden" {
+			return false, false, false, nil
+		}
+	} else {
+		if cache.StockManaged && cache.Backorders == "notify" && cache.CatalogVisibility != "hidden" {
+			return false, false, false, nil
+		}
+	}
+
 	task := db.WooTask{
-		TaskKey:     buildTaskKey(db.WooTaskKindAvailabilityUpdate, cache.WooID, keyParts...),
+		TaskKey:     taskKey,
 		ImportID:    importID,
 		TowarID:     ptrInt64(src.TowarID),
 		WooID:       ptrUint(cache.WooID),
@@ -525,13 +546,13 @@ func sourceProductEligible(src plannerSourceRow) bool {
 	return !src.DoUsuniecia
 }
 
-func supersedePendingWooTasks(tx *gorm.DB, wooID uint, kinds []string, reason string) error {
+func supersedeActiveWooTasks(tx *gorm.DB, wooID uint, kinds []string, reason string) error {
 	if len(kinds) == 0 {
 		return nil
 	}
 	now := time.Now()
 	return tx.Model(&db.WooTask{}).
-		Where("woo_id = ? AND kind IN ? AND status = ?", wooID, kinds, "pending").
+		Where("woo_id = ? AND kind IN ? AND status IN ?", wooID, kinds, []string{"pending", "running"}).
 		Updates(map[string]any{
 			"status":          "superseded",
 			"last_error":      reason,
@@ -540,19 +561,28 @@ func supersedePendingWooTasks(tx *gorm.DB, wooID uint, kinds []string, reason st
 		}).Error
 }
 
+// Invalidate obsolete intent even when the new value already matches cache.
+// Running tasks recheck this status after their GET and before the write.
+func supersedeOtherWooTasks(tx *gorm.DB, wooID uint, kind, taskKey string) error {
+	return tx.Model(&db.WooTask{}).
+		Where("woo_id = ? AND kind = ? AND task_key <> ? AND status IN ?", wooID, kind, taskKey, []string{"pending", "running"}).
+		Updates(map[string]any{
+			"status": "superseded", "last_error": "superseded by newer desired state",
+			"next_attempt_at": nil, "finished_at": time.Now(),
+		}).Error
+}
+
 func enqueueWooTask(tx *gorm.DB, task db.WooTask) (created, requeued, existed bool, err error) {
 	if task.WooID != nil {
-		now := time.Now()
-		if err := tx.Model(&db.WooTask{}).
-			Where("woo_id = ? AND kind = ? AND task_key <> ? AND status = ?", *task.WooID, task.Kind, task.TaskKey, "pending").
-			Updates(map[string]any{
-				"status":          "superseded",
-				"last_error":      "superseded by newer desired state",
-				"next_attempt_at": nil,
-				"finished_at":     now,
-			}).Error; err != nil {
+		if err := supersedeOtherWooTasks(tx, *task.WooID, task.Kind, task.TaskKey); err != nil {
 			return false, false, false, err
 		}
+		var latest uint64
+		if err := tx.Model(&db.WooTask{}).Where("woo_id = ? AND kind = ?", *task.WooID, task.Kind).
+			Select("COALESCE(MAX(revision), 0)").Scan(&latest).Error; err != nil {
+			return false, false, false, err
+		}
+		task.Revision = latest + 1
 	}
 
 	var existing db.WooTask
@@ -560,7 +590,12 @@ func enqueueWooTask(tx *gorm.DB, task db.WooTask) (created, requeued, existed bo
 	case err == nil:
 		switch existing.Status {
 		case "pending", "running":
-			return false, false, true, nil
+			if task.WooID == nil || (existing.Revision > 0 && existing.Revision+1 == task.Revision) {
+				return false, false, true, nil
+			}
+			// A legacy pending task can already be a return to an older key.
+			// Give current intent a revision instead of preserving its old ID order.
+			fallthrough
 		default:
 			updates := map[string]any{
 				"import_id":       task.ImportID,
@@ -568,6 +603,7 @@ func enqueueWooTask(tx *gorm.DB, task db.WooTask) (created, requeued, existed bo
 				"woo_id":          task.WooID,
 				"kind":            task.Kind,
 				"payload_json":    task.PayloadJSON,
+				"revision":        task.Revision,
 				"status":          "pending",
 				"attempts":        0,
 				"last_error":      "",

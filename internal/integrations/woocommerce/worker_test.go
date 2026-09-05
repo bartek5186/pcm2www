@@ -13,8 +13,8 @@ import (
 	"time"
 
 	"github.com/bartek5186/pcm2www/internal/db"
+	"github.com/glebarez/sqlite"
 	"github.com/rs/zerolog"
-	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
 	gormlogger "gorm.io/gorm/logger"
 )
@@ -682,6 +682,15 @@ func newWooWorkerTestDB(t *testing.T) *gorm.DB {
 	if err != nil {
 		t.Fatal(err)
 	}
+	sqlDB, err := gdb.DB()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := sqlDB.Close(); err != nil {
+			t.Errorf("close test DB: %v", err)
+		}
+	})
 	if err := gdb.AutoMigrate(
 		&db.ImportFile{},
 		&db.StProduct{},

@@ -154,3 +154,74 @@ func closeMigrationTestDB(t *testing.T, gdb *gorm.DB) {
 		}
 	})
 }
+
+func TestMigrationV3PreservesV2DataAndBacksUpOnlyOnce(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "v2.db")
+	h, err := OpenWithConfig(filepath.Dir(path), OpenConfig{Driver: "sqlite", Path: path})
+	if err != nil {
+		t.Fatal(err)
+	}
+	closeMigrationTestDB(t, h.DB)
+	if err := h.Migrate(); err != nil {
+		t.Fatal(err)
+	}
+	// Reconstruct the preceding schema rather than leaving new columns in place.
+	for _, col := range []struct {
+		model any
+		name  string
+	}{
+		{&ImportFile{}, "PlanningPending"}, {&StStock{}, "RezerwacjaPrev"}, {&WooTask{}, "Revision"},
+	} {
+		if err := h.DB.Migrator().DropColumn(col.model, col.name); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := h.DB.Where("version = ?", 3).Delete(&SchemaMigration{}).Error; err != nil {
+		t.Fatal(err)
+	}
+	for _, query := range []string{
+		"INSERT INTO import_files(import_id,filename,sha256,status) VALUES(1,'legacy.xml','legacy-sha',1)",
+		"INSERT INTO st_stocks(towar_id,magazyn_id,stan,stan_prev,rezerwacja,import_id) VALUES(42,1,10,10,3,1)",
+		"INSERT INTO woo_tasks(task_id,task_key,woo_id,kind,status,payload_json) VALUES(1,'legacy-price',900,'price.update','pending','{}')",
+	} {
+		if err := h.DB.Exec(query).Error; err != nil {
+			t.Fatal(err)
+		}
+	}
+	before, _ := filepath.Glob(path + ".backup-*")
+	if err := h.Migrate(); err != nil {
+		t.Fatal(err)
+	}
+	after, _ := filepath.Glob(path + ".backup-*")
+	if len(after) != len(before)+1 {
+		t.Fatalf("v3 should make a backup: before=%v after=%v", before, after)
+	}
+	var stock StStock
+	if err := h.DB.First(&stock).Error; err != nil {
+		t.Fatal(err)
+	}
+	if stock.Stan != 10 || stock.StanPrev == nil || *stock.StanPrev != 10 || stock.Rezerwacja != 3 || stock.RezerwacjaPrev != nil {
+		t.Fatalf("legacy stock changed or history was fabricated: %+v", stock)
+	}
+	var task WooTask
+	if err := h.DB.First(&task, "task_id = ?", 1).Error; err != nil {
+		t.Fatal(err)
+	}
+	if task.Status != "pending" || task.Revision != 0 || task.PayloadJSON != "{}" {
+		t.Fatalf("legacy task changed: %+v", task)
+	}
+	var file ImportFile
+	if err := h.DB.First(&file, "import_id = ?", 1).Error; err != nil {
+		t.Fatal(err)
+	}
+	if file.Status != 1 || file.PlanningPending {
+		t.Fatalf("legacy import changed: %+v", file)
+	}
+	if err := h.Migrate(); err != nil {
+		t.Fatal(err)
+	}
+	again, _ := filepath.Glob(path + ".backup-*")
+	if len(again) != len(after) {
+		t.Fatal("repeat migration created another backup")
+	}
+}

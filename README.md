@@ -195,7 +195,11 @@ EAN jest wyłącznie kluczem dopasowania. Synchronizowane są tylko istniejące 
 
 #### Ochrona przed nadpisaniem sprzedaży online
 
-`st_stocks` przechowuje kolumnę `stan_prev` — poprzednią wartość stanu PCM przed ostatnim upsertem (NULL przy pierwszym imporcie produktu). Planner porównuje `stan` z `stan_prev`: jeśli są równe, PCM nie zmienił stanu od ostatniego eksportu, więc różnica w cache Woo prawdopodobnie wynika ze sprzedaży w sklepie — task `stock.update` nie jest generowany. Jeśli PCM zmienił stan (np. pracownik zrobił korektę lub przyjął dostawę), delta ≠ 0 i task jest generowany z wartością absolutną z PCM.
+`st_stocks` przechowuje `stan_prev` i `rezerwacja_prev` — stan oraz rezerwacje z poprzedniego eksportu (NULL przy pierwszym imporcie). Planner porównuje dostępną ilość `max(stan - rezerwacja, 0)` z poprzednią dostępną ilością. Zmiana samych rezerwacji również generuje aktualizację stanu Woo. Jeśli dostępna ilość w PCM się nie zmieniła, różnica w Woo nie powoduje nowego zadania, co chroni sprzedaż online. Już oczekujące zadanie zgodne z bieżącym stanem PCM pozostaje w kolejce.
+
+Migracja nie odtwarza nieznanej historii rezerwacji starszych baz: do pierwszego nowego importu używa bieżących rezerwacji przy porównaniu ze `stan_prev`, zachowując dotychczasową ochronę sprzedaży. Kolejny import zapisuje już obie poprzednie wartości.
+
+Zadania mają numer `revision` określający kolejność planowania dla produktu Woo i rodzaju operacji. Powrót do wcześniejszej wartości (np. cena `10 → 20 → 10`) nadaje ponawianemu zadaniu nową rewizję, niezależnie od jego historycznego `task_id`. Starsze aktywne zadania z inną wartością są unieważniane również wtedy, gdy nowa wartość już odpowiada cache. Worker ponownie sprawdza aktualność po odczycie Woo i przed wysyłką; zakończenie starej rewizji nie nadpisuje stanu ponowionego zadania.
 
 Bezpośrednio przed zapisem worker ponownie sprawdza, czy `woo_id` nadal jest jednoznacznie powiązane z tym samym `towar_id` i EAN. Nieaktualny task dostaje status `superseded` bez wywołania Woo. Każdy zapis jest weryfikowany przez osobny GET — również po zbiorczym POST. Błędy przejściowe (timeout, HTTP 429 i 5xx) są ponawiane z wykładniczym opóźnieniem, jitterem i uwzględnieniem `Retry-After`, maksymalnie do 5 prób. Wspólny circuit breaker wyhamowuje workery podczas awarii sklepu. Błąd zapisu stanu taska do bazy zatrzymuje integrację zamiast udawać powodzenie.
 **Tworzenie nowych produktów w Woo jest [NIEGOTOWE].**
@@ -231,6 +235,8 @@ Deduplikacja pliku odbywa się przez SHA256 zawartości lub niepuste `transmisja
 
 Importer odrzuca powtórzony `towar_id` produktu i klucz stanu `(towar_id, magazyn_id)` wewnątrz jednego XML-a. `towar_id` jest stabilną tożsamością rekordu PCM; `kod`/EAN może się zmienić i wtedy aktualizuje ten sam rekord stagingu. Powiązanie ze sklepem nadal odbywa się wyłącznie po bieżącym EAN. Staging oraz oznaczenie importu jako `done` są zapisywane w jednej transakcji; błąd wycofuje wszystkie zmiany stagingu. Obsługiwane kodowania: ISO-8859-2, Windows-1250 i inne.
 
+Import zapisuje `import_files.planning_pending=true` w tej samej transakcji co staging i status `done`. Oznaczenie jest kasowane dopiero po poprawnym planowaniu, w transakcji razem z zadaniami. Błąd linkowania lub planowania jest ponawiany przy kolejnym sprawdzeniu katalogu, również po archiwizacji XML i restarcie. Importer kończy zaległe planowanie przed wczytaniem kolejnego XML-a, aby nie utracić poprzednich stanów i rezerwacji; oczekuje wtedy na gotowość cache lub ustąpienie błędu. Brak jednoznacznego linku EAN jest poprawnym pominięciem produktu z diagnostyką, a nie błędem wymagającym ponawiania.
+
 Linker wykrywa duplikaty EAN po obu stronach. Powtórzony EAN w PCM tworzy `link_issues.reason=duplicate_ean_source`, powtórzony EAN w Woo tworzy `duplicate_ean_shop`; niejednoznaczny produkt nie jest linkowany ani aktualizowany.
 
 Migracje zapisują wersję w `schema_migrations`, mają minutowy deadline i są idempotentne. Przed zmianą istniejącej bazy SQLite powstaje kopia `pcm2www.db.backup-*` (zostaje pięć ostatnich). Migracja usuwa wyłącznie nadmiarowe duplikaty diagnostyk i starszych rekordów tego samego `towar_id`, zachowując najnowszy, oraz usuwa stare błędne indeksy.
@@ -239,7 +245,7 @@ Proces utrzymuje blokadę `pcm2www.lock`, dlatego druga lokalna instancja nie mo
 
 ## Lokalna walidacja sekwencji XML
 
-Polecenie `./scripts/validate_xml_sequence.sh` kopiuje po kolei wszystkie `imports/incoming_test/exp_wyk_*.xml` do katalogu tymczasowego i importuje je do izolowanej bazy SQLite w pamięci. Nie otwiera ani nie zmienia bazy aplikacji. Po **każdym pojedynczym XML-u** niezależny model referencyjny porównuje pełny stan wszystkich pól `st_products`, `st_stocks` (w tym `stan_prev`) i tożsamość importu. Błąd wskazuje numer kroku, nazwę XML-a oraz produkt lub magazyn, na którym stan się rozszedł.
+Polecenie `./scripts/validate_xml_sequence.sh` kopiuje po kolei wszystkie `imports/incoming_test/exp_wyk_*.xml` do katalogu tymczasowego i importuje je do izolowanej bazy SQLite w pamięci. Nie otwiera ani nie zmienia bazy aplikacji. Po **każdym pojedynczym XML-u** niezależny model referencyjny porównuje pełny stan wszystkich pól `st_products`, `st_stocks` (w tym `stan_prev` i `rezerwacja_prev`) i tożsamość importu. Błąd wskazuje numer kroku, nazwę XML-a oraz produkt lub magazyn, na którym stan się rozszedł.
 
 ## Binarka z GitHub Actions
 

@@ -7,16 +7,17 @@ import (
 
 // import_files
 type ImportFile struct {
-	ImportID     uint   `gorm:"primaryKey;column:import_id"`
-	Filename     string `gorm:"index:idx_import_files_filename_lookup"`
-	FileTimeUTC  string
-	TransmisjaID string `gorm:"index:idx_import_files_transmission_lookup"`
-	SHA256       string `gorm:"uniqueIndex"`
-	SizeBytes    int64
-	Status       int       `gorm:"index"` // 0=pending, 1=done, 2=error
-	LastError    string    `gorm:"type:text"`
-	ReceivedAt   time.Time `gorm:"autoCreateTime"`
-	ProcessedAt  *time.Time
+	ImportID        uint   `gorm:"primaryKey;column:import_id"`
+	Filename        string `gorm:"index:idx_import_files_filename_lookup"`
+	FileTimeUTC     string
+	TransmisjaID    string `gorm:"index:idx_import_files_transmission_lookup"`
+	SHA256          string `gorm:"uniqueIndex"`
+	SizeBytes       int64
+	Status          int       `gorm:"index"` // 0=pending, 1=done, 2=error
+	LastError       string    `gorm:"type:text"`
+	ReceivedAt      time.Time `gorm:"autoCreateTime"`
+	ProcessedAt     *time.Time
+	PlanningPending bool `gorm:"not null;default:false;index"` // staging committed, linking/planning still required
 }
 
 // st_products (staging)
@@ -47,14 +48,15 @@ type StProduct struct {
 
 // st_stock (staging)
 type StStock struct {
-	ID         uint  `gorm:"primaryKey;autoIncrement"`
-	TowarID    int64 `gorm:"uniqueIndex:uniq_towar_mag"`
-	MagazynID  int64 `gorm:"uniqueIndex:uniq_towar_mag"`
-	Stan       float64
-	StanPrev   *float64 // poprzednia wartość stan (NULL = brak historii, pierwszy import)
-	Rezerwacja float64
-	ImportID   uint `gorm:"index"`
-	UpdatedAt  time.Time
+	ID             uint  `gorm:"primaryKey;autoIncrement"`
+	TowarID        int64 `gorm:"uniqueIndex:uniq_towar_mag"`
+	MagazynID      int64 `gorm:"uniqueIndex:uniq_towar_mag"`
+	Stan           float64
+	StanPrev       *float64 // poprzednia wartość stan (NULL = brak historii, pierwszy import)
+	Rezerwacja     float64
+	RezerwacjaPrev *float64 // NULL for first import or legacy history
+	ImportID       uint     `gorm:"index"`
+	UpdatedAt      time.Time
 }
 
 // woo_products_cache
@@ -82,6 +84,7 @@ type WooProductCache struct {
 type WooTask struct {
 	TaskID        uint   `gorm:"primaryKey;column:task_id"`
 	TaskKey       string `gorm:"uniqueIndex"`
+	Revision      uint64 `gorm:"not null;default:0"` // desired-state order per Woo product/kind; independent of TaskID
 	ImportID      uint   `gorm:"index"`
 	TowarID       *int64 `gorm:"index"`
 	WooID         *uint  `gorm:"index"`

@@ -97,9 +97,20 @@ func (w *Woo) completeIfObsolete(gdb *gorm.DB, task db.WooTask) bool {
 	if task.WooID == nil {
 		return false
 	}
+	var current db.WooTask
+	if err := gdb.Where("task_id = ?", task.TaskID).Take(&current).Error; err != nil {
+		if !errors.Is(err, gorm.ErrRecordNotFound) {
+			w.failWooTask(gdb, task, fmt.Errorf("reload task before execution: %w", err))
+		}
+		return true
+	}
+	if current.Revision != task.Revision || (current.Status != "pending" && current.Status != "running") {
+		return true
+	}
 	var newer int64
 	if err := gdb.Model(&db.WooTask{}).
-		Where("woo_id = ? AND kind = ? AND task_id > ? AND status <> ?", *task.WooID, task.Kind, task.TaskID, "superseded").
+		Where("woo_id = ? AND kind = ? AND (revision > ? OR (revision = ? AND task_id > ?)) AND status <> ?",
+			*task.WooID, task.Kind, task.Revision, task.Revision, task.TaskID, "superseded").
 		Count(&newer).Error; err != nil {
 		w.failWooTask(gdb, task, fmt.Errorf("check for newer task: %w", err))
 		return true
@@ -297,7 +308,7 @@ func claimNextSequentialWooTask(gdb *gorm.DB) (*db.WooTask, error) {
 func claimWooTask(gdb *gorm.DB, task db.WooTask) (*db.WooTask, error) {
 	now := time.Now()
 	res := gdb.Model(&db.WooTask{}).
-		Where("task_id = ? AND status = ?", task.TaskID, "pending").
+		Where("task_id = ? AND revision = ? AND status = ?", task.TaskID, task.Revision, "pending").
 		Updates(map[string]any{
 			"status":          "running",
 			"started_at":      now,
@@ -381,7 +392,7 @@ func (w *Woo) handleStockUpdate(ctx context.Context, gdb *gorm.DB, task db.WooTa
 		w.failWooTask(gdb, task, fmt.Errorf("fetch live product before stock update: %w", err))
 		return
 	}
-	if w.completeIfLiveEANStale(gdb, task, product) {
+	if w.completeIfObsolete(gdb, task) || w.completeIfLinkStale(gdb, task) || w.completeIfLiveEANStale(gdb, task, product) {
 		return
 	}
 
@@ -449,7 +460,7 @@ func (w *Woo) handlePriceUpdate(ctx context.Context, gdb *gorm.DB, task db.WooTa
 		w.failWooTask(gdb, task, fmt.Errorf("fetch live product before price update: %w", err))
 		return
 	}
-	if w.completeIfLiveEANStale(gdb, task, product) {
+	if w.completeIfObsolete(gdb, task) || w.completeIfLinkStale(gdb, task) || w.completeIfLiveEANStale(gdb, task, product) {
 		return
 	}
 
@@ -562,7 +573,7 @@ func (w *Woo) handleAvailabilityUpdate(ctx context.Context, gdb *gorm.DB, task d
 		w.failWooTask(gdb, task, fmt.Errorf("fetch live product before availability update: %w", err))
 		return
 	}
-	if w.completeIfLiveEANStale(gdb, task, product) {
+	if w.completeIfObsolete(gdb, task) || w.completeIfLinkStale(gdb, task) || w.completeIfLiveEANStale(gdb, task, product) {
 		return
 	}
 
@@ -741,7 +752,7 @@ func (w *Woo) failWooTask(gdb *gorm.DB, task db.WooTask, err error) {
 	msg := err.Error()
 	now := time.Now()
 	if updateErr := gdb.Model(&db.WooTask{}).
-		Where("task_id = ?", task.TaskID).
+		Where("task_id = ? AND revision = ? AND status IN ?", task.TaskID, task.Revision, []string{"pending", "running"}).
 		Updates(map[string]any{
 			"status":          "error",
 			"last_error":      msg,
@@ -763,7 +774,7 @@ func (w *Woo) retryWooTask(gdb *gorm.DB, task db.WooTask, err error) {
 	w.recordTransientWooFailure()
 	nextAttempt := time.Now().Add(wooRetryDelayForError(task, err))
 	if updateErr := gdb.Model(&db.WooTask{}).
-		Where("task_id = ?", task.TaskID).
+		Where("task_id = ? AND revision = ? AND status IN ?", task.TaskID, task.Revision, []string{"pending", "running"}).
 		Updates(map[string]any{
 			"status":          "pending",
 			"last_error":      err.Error(),
@@ -783,7 +794,7 @@ func (w *Woo) retryWooTask(gdb *gorm.DB, task db.WooTask, err error) {
 
 func (w *Woo) requeueWooTask(gdb *gorm.DB, task db.WooTask, err error) {
 	if updateErr := gdb.Model(&db.WooTask{}).
-		Where("task_id = ?", task.TaskID).
+		Where("task_id = ? AND revision = ? AND status IN ?", task.TaskID, task.Revision, []string{"pending", "running"}).
 		Updates(map[string]any{
 			"status":          "pending",
 			"last_error":      "",
@@ -809,7 +820,7 @@ func (w *Woo) completeWooTask(gdb *gorm.DB, task db.WooTask, status, detail, res
 		lastError = ""
 	}
 	if updateErr := gdb.Model(&db.WooTask{}).
-		Where("task_id = ?", task.TaskID).
+		Where("task_id = ? AND revision = ? AND status IN ?", task.TaskID, task.Revision, []string{"pending", "running"}).
 		Updates(map[string]any{
 			"status":          status,
 			"last_error":      lastError,
@@ -1041,7 +1052,7 @@ func (w *Woo) handlePriceUpdateBatch(ctx context.Context, gdb *gorm.DB, tasks []
 			w.failWooTask(gdb, e.task, fmt.Errorf("product %d missing in batch GET response", e.payload.WooID))
 			continue
 		}
-		if w.completeIfLiveEANStale(gdb, e.task, product) {
+		if w.completeIfObsolete(gdb, e.task) || w.completeIfLinkStale(gdb, e.task) || w.completeIfLiveEANStale(gdb, e.task, product) {
 			continue
 		}
 		switch {
@@ -1071,6 +1082,15 @@ func (w *Woo) handlePriceUpdateBatch(ctx context.Context, gdb *gorm.DB, tasks []
 		}
 	}
 
+	currentUpdates := toUpdate[:0]
+	for _, p := range toUpdate {
+		if w.completeIfObsolete(gdb, p.entry.task) || w.completeIfLinkStale(gdb, p.entry.task) {
+			delete(byWooID, p.entry.payload.WooID)
+			continue
+		}
+		currentUpdates = append(currentUpdates, p)
+	}
+	toUpdate = currentUpdates
 	if len(toUpdate) == 0 {
 		return
 	}
@@ -1175,7 +1195,7 @@ func (w *Woo) handleStockUpdateBatch(ctx context.Context, gdb *gorm.DB, tasks []
 			w.failWooTask(gdb, e.task, fmt.Errorf("product %d missing in batch GET response", e.payload.WooID))
 			continue
 		}
-		if w.completeIfLiveEANStale(gdb, e.task, product) {
+		if w.completeIfObsolete(gdb, e.task) || w.completeIfLinkStale(gdb, e.task) || w.completeIfLiveEANStale(gdb, e.task, product) {
 			continue
 		}
 		switch {
@@ -1200,6 +1220,15 @@ func (w *Woo) handleStockUpdateBatch(ctx context.Context, gdb *gorm.DB, tasks []
 		}
 	}
 
+	currentUpdates := toUpdate[:0]
+	for _, p := range toUpdate {
+		if w.completeIfObsolete(gdb, p.entry.task) || w.completeIfLinkStale(gdb, p.entry.task) {
+			delete(byWooID, p.entry.payload.WooID)
+			continue
+		}
+		currentUpdates = append(currentUpdates, p)
+	}
+	toUpdate = currentUpdates
 	if len(toUpdate) == 0 {
 		return
 	}
@@ -1294,7 +1323,7 @@ func (w *Woo) handleAvailabilityUpdateBatch(ctx context.Context, gdb *gorm.DB, t
 			w.failWooTask(gdb, e.task, fmt.Errorf("product %d missing in batch GET response", e.payload.WooID))
 			continue
 		}
-		if w.completeIfLiveEANStale(gdb, e.task, product) {
+		if w.completeIfObsolete(gdb, e.task) || w.completeIfLinkStale(gdb, e.task) || w.completeIfLiveEANStale(gdb, e.task, product) {
 			continue
 		}
 		if availabilityMatches(product, e.payload) {
@@ -1311,6 +1340,15 @@ func (w *Woo) handleAvailabilityUpdateBatch(ctx context.Context, gdb *gorm.DB, t
 		byWooID[e.payload.WooID] = e
 	}
 
+	currentUpdates := toUpdate[:0]
+	for _, p := range toUpdate {
+		if w.completeIfObsolete(gdb, p.entry.task) || w.completeIfLinkStale(gdb, p.entry.task) {
+			delete(byWooID, p.entry.payload.WooID)
+			continue
+		}
+		currentUpdates = append(currentUpdates, p)
+	}
+	toUpdate = currentUpdates
 	if len(toUpdate) == 0 {
 		return
 	}

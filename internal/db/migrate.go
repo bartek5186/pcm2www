@@ -22,7 +22,7 @@ func (h *Handle) Migrate() error {
 	migrationPending := true
 	if gdb.Migrator().HasTable(&SchemaMigration{}) {
 		var applied int64
-		if err := gdb.Model(&SchemaMigration{}).Where("version = ?", 2).Count(&applied).Error; err != nil {
+		if err := gdb.Model(&SchemaMigration{}).Where("version = ?", 3).Count(&applied).Error; err != nil {
 			return fmt.Errorf("check migration version: %w", err)
 		}
 		migrationPending = applied == 0
@@ -87,6 +87,12 @@ func (h *Handle) Migrate() error {
 	}
 	if err := gdb.Clauses(clause.OnConflict{DoNothing: true}).Create(&SchemaMigration{
 		Version: 2, Name: "stable product identity and diagnostics indexes", AppliedAt: time.Now().UTC(),
+	}).Error; err != nil {
+		return fmt.Errorf("record schema migration: %w", err)
+	}
+
+	if err := gdb.Clauses(clause.OnConflict{DoNothing: true}).Create(&SchemaMigration{
+		Version: 3, Name: "task revisions, reservation history and durable planning", AppliedAt: time.Now().UTC(),
 	}).Error; err != nil {
 		return fmt.Errorf("record schema migration: %w", err)
 	}

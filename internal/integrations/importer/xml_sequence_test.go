@@ -64,12 +64,13 @@ type expectedProduct struct {
 }
 
 type expectedStock struct {
-	ImportID   uint
-	TowarID    int64
-	MagazynID  int64
-	Stan       float64
-	StanPrev   *float64
-	Rezerwacja float64
+	ImportID       uint
+	TowarID        int64
+	MagazynID      int64
+	Stan           float64
+	StanPrev       *float64
+	Rezerwacja     float64
+	RezerwacjaPrev *float64
 }
 
 type expectedImportState struct {
@@ -685,6 +686,8 @@ func applyExpectedImport(state *expectedImportState, importID uint, products []e
 		if prev, ok := state.Stocks[key]; ok {
 			prevStan := prev.Stan
 			stock.StanPrev = &prevStan
+			prevReserved := prev.Rezerwacja
+			stock.RezerwacjaPrev = &prevReserved
 		}
 		stock.ImportID = importID
 		state.Stocks[key] = stock
@@ -744,7 +747,8 @@ func assertExpectedImportState(t *testing.T, gdb *gorm.DB, expected expectedImpo
 		if got.ImportID != want.ImportID ||
 			!sameTestFloat(got.Stan, want.Stan) ||
 			!sameTestFloat(got.Rezerwacja, want.Rezerwacja) ||
-			!sameOptionalFloat(got.StanPrev, want.StanPrev) {
+			!sameOptionalFloat(got.StanPrev, want.StanPrev) ||
+			!sameOptionalFloat(got.RezerwacjaPrev, want.RezerwacjaPrev) {
 			t.Fatalf("checkpoint %d %s: stock mismatch for towar_id=%d magazyn_id=%d got=%+v want=%+v", checkpoint, filename, got.TowarID, got.MagazynID, got, want)
 		}
 	}
@@ -869,7 +873,7 @@ SELECT COUNT(*) FROM (
 	FROM st_products
 	GROUP BY towar_id
 	HAVING COUNT(*) > 1
-) AS duplicates;
+) AS duplicates
 `).Scan(&duplicateProducts).Error; err != nil {
 		t.Fatal(err)
 	}
@@ -884,7 +888,7 @@ SELECT COUNT(*) FROM (
 	FROM st_stocks
 	GROUP BY towar_id, magazyn_id
 	HAVING COUNT(*) > 1
-) AS duplicates;
+) AS duplicates
 `).Scan(&duplicateStocks).Error; err != nil {
 		t.Fatal(err)
 	}
